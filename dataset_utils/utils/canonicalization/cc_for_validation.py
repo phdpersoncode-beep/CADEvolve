@@ -54,6 +54,21 @@ class RoundTripValidation:
 
 
 @dataclass(frozen=True)
+class QuantizedGeometryValidation:
+    """Geometry fidelity after the legacy CADEvolve integer binarization."""
+
+    success: bool
+    quantized_pair: RoundTripValidation | None = None
+    raw_to_quantized_chamfer: float | None = None
+    chamfer_threshold: float = 0.15
+    sample_points: int = 0
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class PrefixValidation:
     success: bool
     checked_prefixes: int
@@ -194,6 +209,276 @@ def validate_round_trip(
         )
     except Exception as error:  # Validation must report per-file failures.
         return RoundTripValidation(success=False, error=f"{type(error).__name__}: {error}")
+
+
+def binarize_numeric_literals(
+    code: str, *, zero_tolerance: float = 1e-7, min_positive: int = 1
+) -> str:
+    """Apply CADEvolve's existing integer-literal binarizer to source code.
+
+    This is a validation transform only.  CC-for output itself stays symbolic and
+    retains the source units; the legacy binarizer is applied to both programs when
+    checking that canonicalization commutes with the downstream quantization step.
+    """
+
+    # Imported lazily because syntax-only CC-for conversion has no NumPy/CadQuery
+    # dependency, while the legacy binarization module does.
+    from .binarization import Binarize
+
+    tree = ast.parse(code)
+    binarizer = Binarize(
+        zero_tol=zero_tolerance, min_positive=min_positive
+    )
+
+    # The legacy transformer clamps literal arguments such as ``.chamfer(0.4)``
+    # but misses the equivalent symbolic form ``radius = 0.4; .chamfer(radius)``.
+    # CC-for deliberately introduces/retains those names, so collect parameters
+    # feeding non-zero method slots and clamp their definitions after rounding.
+    required_modes: dict[str, str] = {}
+    required_attribute_modes: dict[str, str] = {}
+    protected_predicate_literals: dict[tuple[int, int], int | float] = {}
+    for comparison in (
+        node for node in ast.walk(tree) if isinstance(node, ast.Compare)
+    ):
+        for comparator in comparison.comparators:
+            for constant in ast.walk(comparator):
+                value = constant.value if isinstance(constant, ast.Constant) else None
+                if (
+                    isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and 0 < abs(value) <= 0.1
+                    and hasattr(constant, "lineno")
+                ):
+                    protected_predicate_literals[
+                        (constant.lineno, constant.col_offset)
+                    ] = value
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(
+            node.func, ast.Attribute
+        ):
+            continue
+        spec = binarizer.nonzero_methods.get(node.func.attr.lower())
+        if spec is None:
+            continue
+        mode = str(spec.get("mode", "gt0"))
+        expressions: list[ast.AST] = []
+        for index in spec.get("pos", []):
+            if 0 <= index < len(node.args):
+                expressions.append(node.args[index])
+        keyword_names = set(spec.get("kw", []))
+        expressions.extend(
+            keyword.value
+            for keyword in node.keywords
+            if keyword.arg in keyword_names
+        )
+        for expression in expressions:
+            for name_node in ast.walk(expression):
+                if isinstance(name_node, ast.Name) and isinstance(
+                    name_node.ctx, ast.Load
+                ):
+                    required_modes[name_node.id] = mode
+                elif isinstance(name_node, ast.Attribute) and isinstance(
+                    name_node.ctx, ast.Load
+                ):
+                    required_attribute_modes[name_node.attr] = mode
+
+    tree = binarizer.visit(tree)
+
+    class ClampSymbolicMethodParameters(ast.NodeTransformer):
+        def visit_Constant(self, node: ast.Constant) -> ast.AST:
+            protected = protected_predicate_literals.get(
+                (getattr(node, "lineno", -1), getattr(node, "col_offset", -1))
+            )
+            if protected is not None:
+                return ast.copy_location(ast.Constant(value=protected), node)
+            return node
+
+        def _clamp(self, name: str, value: ast.AST) -> ast.AST:
+            mode = required_modes.get(name) or required_attribute_modes.get(name)
+            if isinstance(value, ast.Constant) and mode is not None:
+                return binarizer._clamp_const(
+                    value, mode
+                )
+            return value
+
+        def visit_Call(self, node: ast.Call) -> ast.AST:
+            node = self.generic_visit(node)
+            for keyword in node.keywords:
+                if (
+                    keyword.arg in required_attribute_modes
+                    and isinstance(keyword.value, ast.Constant)
+                ):
+                    keyword.value = binarizer._clamp_const(
+                        keyword.value,
+                        required_attribute_modes[keyword.arg],
+                    )
+            return node
+
+        def visit_Assign(self, node: ast.Assign) -> ast.AST:
+            node = self.generic_visit(node)
+            if len(node.targets) == 1 and isinstance(
+                node.targets[0], ast.Name
+            ):
+                node.value = self._clamp(node.targets[0].id, node.value)
+            return node
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AST:
+            node = self.generic_visit(node)
+            if isinstance(node.target, ast.Name) and node.value is not None:
+                node.value = self._clamp(node.target.id, node.value)
+            return node
+
+    tree = ClampSymbolicMethodParameters().visit(tree)
+    ast.fix_missing_locations(tree)
+    quantized = ast.unparse(tree).rstrip() + "\n"
+    compile(quantized, "<binarized-cad-program>", "exec")
+    return quantized
+
+
+def _sample_normalized_surface(
+    result: Any,
+    *,
+    sample_points: int,
+    random_seed: int,
+    tessellation_tolerance: float,
+) -> Any:
+    import numpy as np
+
+    shape = _as_shape(result)
+    vertices_raw, faces_raw = shape.tessellate(
+        tessellation_tolerance, 0.1
+    )
+    vertices = np.asarray(
+        [vertex.toTuple() for vertex in vertices_raw], dtype=np.float64
+    )
+    faces = np.asarray(faces_raw, dtype=np.int64)
+    if len(vertices) == 0 or len(faces) == 0:
+        raise ValueError("shape tessellation produced no surface triangles")
+
+    triangles = vertices[faces]
+    cross = np.cross(
+        triangles[:, 1] - triangles[:, 0],
+        triangles[:, 2] - triangles[:, 0],
+    )
+    areas = np.linalg.norm(cross, axis=1) * 0.5
+    valid = areas > np.finfo(np.float64).eps
+    triangles = triangles[valid]
+    areas = areas[valid]
+    if len(triangles) == 0:
+        raise ValueError("shape tessellation contains only degenerate triangles")
+
+    rng = np.random.default_rng(random_seed)
+    choices = rng.choice(
+        len(triangles),
+        size=sample_points,
+        replace=True,
+        p=areas / areas.sum(),
+    )
+    chosen = triangles[choices]
+    root_u = np.sqrt(rng.random(sample_points))
+    v = rng.random(sample_points)
+    points = (
+        (1.0 - root_u)[:, None] * chosen[:, 0]
+        + (root_u * (1.0 - v))[:, None] * chosen[:, 1]
+        + (root_u * v)[:, None] * chosen[:, 2]
+    )
+
+    bbox = shape.BoundingBox()
+    minimum = np.asarray((bbox.xmin, bbox.ymin, bbox.zmin))
+    maximum = np.asarray((bbox.xmax, bbox.ymax, bbox.zmax))
+    extent = float(np.max(maximum - minimum))
+    if not math.isfinite(extent) or extent <= 0:
+        raise ValueError(f"shape has invalid maximum extent: {extent}")
+    return (points - (minimum + maximum) * 0.5) / extent
+
+
+def _symmetric_squared_chamfer(left: Any, right: Any) -> float:
+    import numpy as np
+    from scipy.spatial import cKDTree
+
+    left_distance, _ = cKDTree(left).query(right, k=1)
+    right_distance, _ = cKDTree(right).query(left, k=1)
+    return float(
+        np.mean(np.square(left_distance))
+        + np.mean(np.square(right_distance))
+    )
+
+
+def validate_quantized_geometry(
+    original_code: str,
+    canonical_code: str,
+    *,
+    result_name: str = "result",
+    sample_points: int = 4_096,
+    random_seed: int = 0,
+    chamfer_threshold: float = 0.15,
+    tessellation_tolerance: float = 0.1,
+) -> QuantizedGeometryValidation:
+    """Validate CC-for before and after CADEvolve-style binarization.
+
+    Two conditions must hold: independently binarizing the source and CC-for code
+    produces equivalent solids, and the binarized CC-for solid remains close to the
+    raw source solid under the normalized symmetric squared Chamfer metric already
+    used by CADEvolve's geometry-normalization stages.
+    """
+
+    if sample_points < 1:
+        raise ValueError("sample_points must be positive")
+    try:
+        quantized_original = binarize_numeric_literals(original_code)
+        quantized_canonical = binarize_numeric_literals(canonical_code)
+        quantized_pair = validate_round_trip(
+            quantized_original,
+            quantized_canonical,
+            result_name=result_name,
+            relative_tolerance=1e-6,
+            absolute_tolerance=1e-6,
+        )
+        if not quantized_pair.success:
+            return QuantizedGeometryValidation(
+                success=False,
+                quantized_pair=quantized_pair,
+                chamfer_threshold=chamfer_threshold,
+                sample_points=sample_points,
+                error="source and CC-for diverged after binarization",
+            )
+
+        original_ns = execute_program(original_code)
+        quantized_ns = execute_program(quantized_canonical)
+        original_points = _sample_normalized_surface(
+            original_ns.get(result_name),
+            sample_points=sample_points,
+            random_seed=random_seed,
+            tessellation_tolerance=tessellation_tolerance,
+        )
+        quantized_points = _sample_normalized_surface(
+            quantized_ns.get(result_name),
+            sample_points=sample_points,
+            random_seed=random_seed,
+            tessellation_tolerance=tessellation_tolerance,
+        )
+        chamfer = _symmetric_squared_chamfer(
+            original_points, quantized_points
+        )
+        return QuantizedGeometryValidation(
+            success=chamfer <= chamfer_threshold,
+            quantized_pair=quantized_pair,
+            raw_to_quantized_chamfer=chamfer,
+            chamfer_threshold=chamfer_threshold,
+            sample_points=sample_points,
+            error=(
+                None
+                if chamfer <= chamfer_threshold
+                else f"normalized Chamfer {chamfer} exceeds {chamfer_threshold}"
+            ),
+        )
+    except Exception as error:
+        return QuantizedGeometryValidation(
+            success=False,
+            chamfer_threshold=chamfer_threshold,
+            sample_points=sample_points,
+            error=f"{type(error).__name__}: {error}",
+        )
 
 
 _WP_RE = re.compile(r"^wp(\d+)$")
@@ -410,14 +695,17 @@ __all__ = [
     "PerturbationCase",
     "PerturbationValidation",
     "PrefixValidation",
+    "QuantizedGeometryValidation",
     "RoundTripValidation",
     "ShapeSignature",
     "SignatureComparison",
     "compare_signatures",
+    "binarize_numeric_literals",
     "execute_program",
     "override_numeric_parameter",
     "shape_signature",
     "validate_parameter_perturbations",
     "validate_prefixes",
+    "validate_quantized_geometry",
     "validate_round_trip",
 ]

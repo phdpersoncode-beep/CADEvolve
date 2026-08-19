@@ -23,6 +23,7 @@ from typing import Any, Iterable, Iterator, Sequence
 from utils.canonicalization.cc_for import CCForConfig, canonicalize_code
 from utils.canonicalization.cc_for_validation import (
     validate_prefixes,
+    validate_quantized_geometry,
     validate_round_trip,
 )
 
@@ -69,6 +70,9 @@ class CorpusReport:
     round_trip_failed: int = 0
     prefix_passed: int = 0
     prefix_failed: int = 0
+    quantized_geometry_passed: int = 0
+    quantized_geometry_failed: int = 0
+    quantized_chamfer_distances: list[float] = field(default_factory=list)
     elapsed_seconds: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -81,6 +85,16 @@ class CorpusReport:
         payload["structural_pass_rate"] = (
             self.structural_passed / total if total else 0.0
         )
+        distances = sorted(self.quantized_chamfer_distances)
+        if distances:
+            percentile_index = max(0, (95 * len(distances) + 99) // 100 - 1)
+            payload["quantized_chamfer_mean"] = sum(distances) / len(distances)
+            payload["quantized_chamfer_p95"] = distances[percentile_index]
+            payload["quantized_chamfer_max"] = distances[-1]
+        else:
+            payload["quantized_chamfer_mean"] = None
+            payload["quantized_chamfer_p95"] = None
+            payload["quantized_chamfer_max"] = None
         return payload
 
 
@@ -245,6 +259,9 @@ def validate_corpus(
     max_failure_records: int = 100,
     execution_samples: int = 0,
     validate_sample_prefixes: bool = False,
+    validate_sample_quantization: bool = False,
+    quantized_surface_points: int = 4_096,
+    quantized_chamfer_threshold: float = 0.15,
     random_seed: int = 0,
     extension_directory: Path | None = None,
     shard_retries: int = 2,
@@ -431,6 +448,29 @@ def validate_corpus(
                 execution_failures.append(
                     {"uuid": uuid, "check": "prefix", **prefixes.to_dict()}
                 )
+        if validate_sample_quantization:
+            quantized = validate_quantized_geometry(
+                source,
+                canonical,
+                sample_points=quantized_surface_points,
+                random_seed=random_seed,
+                chamfer_threshold=quantized_chamfer_threshold,
+            )
+            if quantized.raw_to_quantized_chamfer is not None:
+                report.quantized_chamfer_distances.append(
+                    quantized.raw_to_quantized_chamfer
+                )
+            if quantized.success:
+                report.quantized_geometry_passed += 1
+            else:
+                report.quantized_geometry_failed += 1
+                execution_failures.append(
+                    {
+                        "uuid": uuid,
+                        "check": "quantized_geometry",
+                        **quantized.to_dict(),
+                    }
+                )
 
     report.elapsed_seconds = round(time.monotonic() - started, 6)
     payload = _report_payload(
@@ -469,6 +509,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-failure-records", type=int, default=100)
     parser.add_argument("--execution-samples", type=int, default=0)
     parser.add_argument("--validate-sample-prefixes", action="store_true")
+    parser.add_argument("--validate-sample-quantization", action="store_true")
+    parser.add_argument("--quantized-surface-points", type=int, default=4_096)
+    parser.add_argument("--quantized-chamfer-threshold", type=float, default=0.15)
     parser.add_argument("--random-seed", type=int, default=0)
     parser.add_argument("--extension-directory", type=Path)
     parser.add_argument("--shard-retries", type=int, default=2)
@@ -494,6 +537,9 @@ def main() -> None:
         max_failure_records=args.max_failure_records,
         execution_samples=args.execution_samples,
         validate_sample_prefixes=args.validate_sample_prefixes,
+        validate_sample_quantization=args.validate_sample_quantization,
+        quantized_surface_points=args.quantized_surface_points,
+        quantized_chamfer_threshold=args.quantized_chamfer_threshold,
         random_seed=args.random_seed,
         extension_directory=args.extension_directory,
         shard_retries=args.shard_retries,
@@ -518,6 +564,11 @@ def main() -> None:
             "round_trip_failed",
             "prefix_passed",
             "prefix_failed",
+            "quantized_geometry_passed",
+            "quantized_geometry_failed",
+            "quantized_chamfer_mean",
+            "quantized_chamfer_p95",
+            "quantized_chamfer_max",
             "elapsed_seconds",
         )
     }

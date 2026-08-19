@@ -1462,6 +1462,56 @@ class _WorkplaneLowerer:
                 self.reserved.add(name)
                 return name
 
+    def _geometry_assignment_candidates(
+        self, statements: Sequence[ast.stmt]
+    ) -> set[str]:
+        """Find loop assignments that can establish geometry state.
+
+        This prepass is deliberately conservative.  It is used only to decide
+        whether a loop-carried Python name needs a stable runtime assignment;
+        the normal expression lowerer still decides whether each concrete value
+        is geometry.  The important case is ``acc = None`` followed by
+        ``acc = part if acc is None else acc.union(part)`` inside a loop.
+        """
+
+        candidates: set[str] = set()
+        for statement in statements:
+            for node in ast.walk(statement):
+                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    continue
+                value = node.value
+                if value is None:
+                    continue
+                has_geometry_call = any(
+                    isinstance(call, ast.Call)
+                    and (
+                        _is_workplane_constructor(call)
+                        or (
+                            isinstance(call.func, ast.Name)
+                            and call.func.id in self.geometry_factories
+                        )
+                        or (
+                            isinstance(call.func, ast.Attribute)
+                            and (
+                                call.func.attr in self.geometry_factories
+                                or (
+                                    call.func.attr
+                                    in _CADQUERY_GEOMETRY_METHODS
+                                    and call.func.attr
+                                    not in _NON_GEOMETRY_METHODS
+                                )
+                            )
+                        )
+                    )
+                    for call in ast.walk(value)
+                )
+                if not has_geometry_call:
+                    continue
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    candidates.update(_target_names(target))
+        return candidates
+
     def _emit_geometry_call(self, call: ast.Call, location: ast.AST) -> tuple[ast.Assign, ast.Name]:
         name = self._new_wp()
         assignment = ast.Assign(
@@ -1861,10 +1911,20 @@ class _WorkplaneLowerer:
             if isinstance(stmt, ast.For):
                 assigned = _assigned_names(ast.Module(body=stmt.body, type_ignores=[]))
                 carried = assigned & _loads_before_definition(stmt.body)
-                for name in sorted(carried & (set(aliases) | set(dynamic))):
-                    initializer = self._materialize_alias(name, aliases, dynamic)
-                    if initializer is not None:
-                        output.append(ast.copy_location(initializer, stmt))
+                geometry_carried = carried & self._geometry_assignment_candidates(
+                    stmt.body
+                )
+                for name in sorted(
+                    carried & (set(aliases) | set(dynamic) | geometry_carried)
+                ):
+                    if name in aliases:
+                        initializer = self._materialize_alias(
+                            name, aliases, dynamic
+                        )
+                        if initializer is not None:
+                            output.append(ast.copy_location(initializer, stmt))
+                    elif name in geometry_carried and name not in dynamic:
+                        dynamic[name] = self._state_name(name)
 
                 stmt.iter = _rewrite_loads(stmt.iter, aliases)
                 stmt.body, body_aliases, body_dynamic = self._lower_block(

@@ -16,8 +16,10 @@ from dataset_utils.utils.canonicalization.cc_for import (
     validate_structure,
 )
 from dataset_utils.utils.canonicalization.cc_for_validation import (
+    binarize_numeric_literals,
     validate_parameter_perturbations,
     validate_prefixes,
+    validate_quantized_geometry,
     validate_round_trip,
 )
 
@@ -46,6 +48,20 @@ def assignment_counts(code: str) -> dict[str, int]:
 
 
 class CCForStructuralTests(unittest.TestCase):
+    def test_binarization_clamps_namespace_geometry_and_keeps_predicate_epsilon(
+        self,
+    ) -> None:
+        quantized = binarize_numeric_literals(
+            """
+from types import SimpleNamespace as Measures
+m = Measures(chamfer_distance=0.5)
+selected = [x for x in (0, 1) if abs(x) < 0.01]
+result = base.chamfer(m.chamfer_distance)
+"""
+        )
+        self.assertIn("chamfer_distance=1", quantized)
+        self.assertIn("abs(x) < 0.01", quantized)
+
     def test_hf_runner_checkpoints_after_each_completed_batch(self) -> None:
         source = "import cadquery as cq\nresult = cq.Workplane('XY').box(1, 1, 1)\n"
         shards = [
@@ -400,6 +416,45 @@ result = cq.Workplane('XY').box(length, width, 2)
 
 @unittest.skipUnless(HAS_CADQUERY, "CadQuery is required for geometry validation")
 class CCForCadQueryTests(unittest.TestCase):
+    def test_loop_carried_none_geometry_accumulator_round_trips(self) -> None:
+        source = """
+import cadquery as cq
+count = 3
+spacing = 3
+accumulator = None
+for i in range(count):
+    piece = cq.Workplane('XY').box(1, 1, 1).translate((i * spacing, 0, 0))
+    accumulator = piece if accumulator is None else accumulator.union(piece)
+result = accumulator
+"""
+        converted = canonicalize_code(source)
+        self.assertRegex(converted.code, r"accumulator = wp\d+")
+        validation = validate_round_trip(source, converted.code)
+        self.assertTrue(validation.success, validation.to_dict())
+
+    def test_user_examples_survive_symbolic_numeric_binarization(self) -> None:
+        for name in (
+            "mounting_base_with_boss.py",
+            "sinusoidal_channel_housing.py",
+            "vented_cap.py",
+        ):
+            source = (FIXTURES / name).read_text(encoding="utf-8")
+            converted = canonicalize_code(source)
+            with self.subTest(fixture=name):
+                validation = validate_quantized_geometry(
+                    source,
+                    converted.code,
+                    sample_points=1_024,
+                    random_seed=0,
+                )
+                self.assertTrue(validation.success, validation.to_dict())
+
+        vented = canonicalize_code(
+            (FIXTURES / "vented_cap.py").read_text(encoding="utf-8")
+        )
+        quantized = binarize_numeric_literals(vented.code)
+        self.assertIn("chamfer_distance = 1", quantized)
+
     def test_round_trip_and_prefixes_on_zero_to_cad_examples(self) -> None:
         for fixture in sorted(FIXTURES.glob("*.py")):
             source = fixture.read_text(encoding="utf-8")
