@@ -83,6 +83,9 @@ Each converted file records:
 - optional original/canonical shape invariants (bounding box, volume, area, and
   topology counts);
 - optional executable-prefix success;
+- optional source/CC-for equivalence after CADEvolve-style numeric binarization;
+- optional normalized symmetric surface Chamfer between the raw and binarized
+  CC-for solids;
 - optional perturbation consistency for named parameters.
 
 The perturbation check is important for plane construction: changing an angle in the

@@ -70,12 +70,21 @@ PYTHONPATH=. python canonicalization_run/zero_to_cad_hf_validation.py \
   --split train \
   --loop-mode preserve \
   --execution-samples 100 \
+  --validate-sample-prefixes \
+  --validate-sample-quantization \
   --report logs/zero_to_cad_100k_preserve.json
 ```
 
 Use `--max-rows` or `--max-shards` for a smoke run. The JSON report includes the
 dataset revision, strict structural pass rate, aggregate transformations and
-warnings, bounded failure examples, and optional geometry round-trip results.
+warnings, bounded failure examples, exact geometry round-trip results, and optional
+normalized post-binarization surface Chamfer. Reports are atomically checkpointed
+after every shard batch. Use `--skip-shards` to resume from the reported
+`next_shard_offset`, and `--failure-source-dir` to retain structural outliers for
+regression work.
+
+The reproducible Zero-to-CAD validation results and metric definitions are in
+[`docs/cc_for_zero_to_cad_validation.md`](../docs/cc_for_zero_to_cad_validation.md).
 
 ## Notes on config paths
 

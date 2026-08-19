@@ -70,7 +70,9 @@ cd dataset_utils
 
 For parameter-preserving Step-ToCAD data, use the CC-for batch converter documented
 in [`docs/cc_for_canonicalization.md`](docs/cc_for_canonicalization.md). It keeps named
-parameters and loops while lowering CadQuery chains to explicit `wpN` steps.
+parameters and loops while lowering CadQuery chains to explicit `wpN` steps. See the
+[`Zero-to-CAD validation report`](docs/cc_for_zero_to_cad_validation.md) for structural,
+exact-solid, executable-prefix, and post-binarization geometry results.
 
 Install only the converter and validation dependencies with:
 
