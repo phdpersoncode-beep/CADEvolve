@@ -210,6 +210,42 @@ def _latest_geometry(namespace: dict[str, Any], result_name: str) -> Any | None:
     return namespace.get(result_name)
 
 
+def _defines_geometry_state(code: str, result_name: str) -> bool:
+    tree = ast.parse(code)
+
+    class GeometryDefinitionFinder(ast.NodeVisitor):
+        found = False
+
+        def _visit_targets(self, targets: Iterable[ast.AST]) -> None:
+            for target in targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                if target.id == result_name or _WP_RE.match(target.id):
+                    self.found = True
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            self._visit_targets(node.targets)
+            self.visit(node.value)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            self._visit_targets([node.target])
+            if node.value is not None:
+                self.visit(node.value)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return
+
+    finder = GeometryDefinitionFinder()
+    finder.visit(tree)
+    return finder.found
+
+
 def validate_prefixes(code: str, result_name: str = "result") -> PrefixValidation:
     actions = decompose_actions(code, result_name=result_name)
     if not actions:
@@ -217,14 +253,18 @@ def validate_prefixes(code: str, result_name: str = "result") -> PrefixValidatio
 
     chunks: list[str] = []
     checked = 0
+    geometry_started = False
     for index, action in enumerate(actions):
         chunks.append(action.code)
         if action.kind == "preamble":
             continue
         try:
+            geometry_started = geometry_started or _defines_geometry_state(
+                action.code, result_name
+            )
             namespace = execute_program("\n".join(chunks))
             latest = _latest_geometry(namespace, result_name)
-            if latest is None:
+            if geometry_started and latest is None:
                 raise ValueError("prefix did not expose a Workplane/Shape state")
             checked += 1
         except Exception as error:
@@ -381,4 +421,3 @@ __all__ = [
     "validate_prefixes",
     "validate_round_trip",
 ]
-

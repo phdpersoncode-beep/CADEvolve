@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import random
+import sys
 import tempfile
 import time
 from collections import Counter
@@ -207,6 +208,8 @@ def validate_corpus(
     validate_sample_prefixes: bool = False,
     random_seed: int = 0,
     extension_directory: Path | None = None,
+    shard_retries: int = 2,
+    progress: bool = False,
 ) -> dict[str, Any]:
     started = time.monotonic()
     revision, manifest = fetch_parquet_manifest(dataset)
@@ -248,73 +251,94 @@ def validate_corpus(
         for batch in _batched(split_shards, max(1, shard_batch_size)):
             if stop:
                 break
-            try:
-                rows = _read_projected_rows(connection, batch, fetch_size)
-                for uuid, encoded_code in rows:
-                    if max_rows is not None and report.rows >= max_rows:
-                        stop = True
-                        break
-                    report.rows += 1
-                    try:
-                        source = _decode_code(encoded_code)
-                        report.source_bytes += len(source.encode("utf-8"))
-                        converted = canonicalize_code(
-                            source,
-                            CCForConfig(
-                                loop_mode=loop_mode,  # type: ignore[arg-type]
-                                max_unroll_iterations=max_unroll_iterations,
-                            ),
-                        )
-                        report.canonical_bytes += len(
-                            converted.code.encode("utf-8")
-                        )
-                        conversion_report = converted.report
-                        report.flattened_namespaces += len(
-                            conversion_report.flattened_namespaces
-                        )
-                        report.preserved_loops += conversion_report.preserved_loops
-                        report.unrolled_loops += conversion_report.unrolled_loops
-                        report.workplane_steps += conversion_report.workplane_steps
-                        report.warnings.update(conversion_report.warnings)
-                        if conversion_report.structural_errors:
-                            report.structural_failed += 1
-                            report.structural_errors.update(
-                                conversion_report.structural_errors
-                            )
-                            _record_failure(
-                                failures,
-                                maximum=max_failure_records,
-                                uuid=str(uuid),
-                                split=split,
-                                errors=conversion_report.structural_errors,
-                            )
-                            continue
-                        report.structural_passed += 1
+            batch_rows: list[tuple[str, Any]] | None = None
+            last_error: Exception | None = None
+            for _attempt in range(max(0, shard_retries) + 1):
+                try:
+                    # Buffer only the projected source columns. This makes retries
+                    # idempotent if a remote range request fails mid-batch.
+                    batch_rows = list(
+                        _read_projected_rows(connection, batch, fetch_size)
+                    )
+                    break
+                except Exception as error:
+                    last_error = error
+            if batch_rows is None:
+                assert last_error is not None
+                report.shard_errors.append(
+                    f"{split}/{batch[0].filename}..{batch[-1].filename}: "
+                    f"{type(last_error).__name__}: {last_error}"
+                )
+                continue
 
-                        if execution_samples > 0:
-                            seen_for_reservoir += 1
-                            item = (str(uuid), source, converted.code)
-                            if len(reservoir) < execution_samples:
-                                reservoir.append(item)
-                            else:
-                                replacement = rng.randrange(seen_for_reservoir)
-                                if replacement < execution_samples:
-                                    reservoir[replacement] = item
-                    except Exception as error:
-                        message = f"{type(error).__name__}: {error}"
+            for uuid, encoded_code in batch_rows:
+                if max_rows is not None and report.rows >= max_rows:
+                    stop = True
+                    break
+                report.rows += 1
+                try:
+                    source = _decode_code(encoded_code)
+                    report.source_bytes += len(source.encode("utf-8"))
+                    converted = canonicalize_code(
+                        source,
+                        CCForConfig(
+                            loop_mode=loop_mode,  # type: ignore[arg-type]
+                            max_unroll_iterations=max_unroll_iterations,
+                        ),
+                    )
+                    report.canonical_bytes += len(
+                        converted.code.encode("utf-8")
+                    )
+                    conversion_report = converted.report
+                    report.flattened_namespaces += len(
+                        conversion_report.flattened_namespaces
+                    )
+                    report.preserved_loops += conversion_report.preserved_loops
+                    report.unrolled_loops += conversion_report.unrolled_loops
+                    report.workplane_steps += conversion_report.workplane_steps
+                    report.warnings.update(conversion_report.warnings)
+                    if conversion_report.structural_errors:
                         report.structural_failed += 1
-                        report.structural_errors[message] += 1
+                        report.structural_errors.update(
+                            conversion_report.structural_errors
+                        )
                         _record_failure(
                             failures,
                             maximum=max_failure_records,
                             uuid=str(uuid),
                             split=split,
-                            errors=[message],
+                            errors=conversion_report.structural_errors,
                         )
-            except Exception as error:
-                report.shard_errors.append(
-                    f"{split}/{batch[0].filename}..{batch[-1].filename}: "
-                    f"{type(error).__name__}: {error}"
+                        continue
+                    report.structural_passed += 1
+
+                    if execution_samples > 0:
+                        seen_for_reservoir += 1
+                        item = (str(uuid), source, converted.code)
+                        if len(reservoir) < execution_samples:
+                            reservoir.append(item)
+                        else:
+                            replacement = rng.randrange(seen_for_reservoir)
+                            if replacement < execution_samples:
+                                reservoir[replacement] = item
+                except Exception as error:
+                    message = f"{type(error).__name__}: {error}"
+                    report.structural_failed += 1
+                    report.structural_errors[message] += 1
+                    _record_failure(
+                        failures,
+                        maximum=max_failure_records,
+                        uuid=str(uuid),
+                        split=split,
+                        errors=[message],
+                    )
+            if progress:
+                print(
+                    f"validated={report.rows} "
+                    f"passed={report.structural_passed} "
+                    f"failed={report.structural_failed}",
+                    file=sys.stderr,
+                    flush=True,
                 )
 
     report.execution_sample_size = len(reservoir)
@@ -375,6 +399,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--validate-sample-prefixes", action="store_true")
     parser.add_argument("--random-seed", type=int, default=0)
     parser.add_argument("--extension-directory", type=Path)
+    parser.add_argument("--shard-retries", type=int, default=2)
+    parser.add_argument("--progress", action="store_true")
     return parser.parse_args()
 
 
@@ -396,8 +422,34 @@ def main() -> None:
         validate_sample_prefixes=args.validate_sample_prefixes,
         random_seed=args.random_seed,
         extension_directory=args.extension_directory,
+        shard_retries=args.shard_retries,
+        progress=args.progress,
     )
-    print(json.dumps(payload["summary"], indent=2, sort_keys=True))
+    summary = payload["summary"]
+    console_summary = {
+        key: summary[key]
+        for key in (
+            "dataset",
+            "revision",
+            "loop_mode",
+            "splits",
+            "parquet_shards",
+            "rows",
+            "structural_passed",
+            "structural_failed",
+            "structural_pass_rate",
+            "execution_sample_size",
+            "round_trip_passed",
+            "round_trip_failed",
+            "prefix_passed",
+            "prefix_failed",
+            "elapsed_seconds",
+        )
+    }
+    console_summary["warning_messages"] = len(summary["warnings"])
+    console_summary["warning_occurrences"] = sum(summary["warnings"].values())
+    console_summary["report"] = str(args.report)
+    print(json.dumps(console_summary, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

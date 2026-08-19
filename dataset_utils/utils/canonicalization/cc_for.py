@@ -293,8 +293,8 @@ def _flatten_simple_namespaces(tree: ast.Module, report: CCForReport) -> ast.Mod
     mappings: dict[str, dict[str, str]] = {}
     canonical_roots: dict[str, str] = {}
 
-    def allocate(root: str, key: str) -> str:
-        candidate = key
+    def allocate(root: str, key: str, *, force_prefix: bool = False) -> str:
+        candidate = f"{root}_{key}" if force_prefix else key
         if candidate in reserved:
             candidate = f"{root}_{key}"
         base = candidate
@@ -304,6 +304,82 @@ def _flatten_simple_namespaces(tree: ast.Module, report: CCForReport) -> ast.Mod
             suffix += 1
         reserved.add(candidate)
         return candidate
+
+    def flatten_call(
+        root: str,
+        call: ast.Call,
+        location: ast.AST,
+        *,
+        nested: bool,
+    ) -> tuple[list[ast.stmt], ast.Assign] | None:
+        if call.args or any(keyword.arg is None for keyword in call.keywords):
+            return None
+
+        key_map: dict[str, str] = {}
+        emitted: list[ast.stmt] = []
+        for keyword in call.keywords:
+            assert keyword.arg is not None
+            if _is_namespace_call(keyword.value, constructors, modules):
+                nested_call = keyword.value
+                assert isinstance(nested_call, ast.Call)
+                nested_root = allocate(root, keyword.arg)
+                flattened_nested = flatten_call(
+                    nested_root,
+                    nested_call,
+                    location,
+                    nested=True,
+                )
+                if flattened_nested is None:
+                    # Preserve the nested constructor as a named value even when
+                    # its positional/** form cannot be recursively flattened.
+                    assignment = ast.Assign(
+                        targets=[ast.Name(id=nested_root, ctx=ast.Store())],
+                        value=keyword.value,
+                    )
+                    emitted.append(ast.copy_location(assignment, location))
+                else:
+                    nested_statements, nested_reconstruction = flattened_nested
+                    emitted.extend(nested_statements)
+                    emitted.append(nested_reconstruction)
+                key_map[keyword.arg] = nested_root
+                continue
+
+            if (
+                isinstance(keyword.value, ast.Name)
+                and keyword.value.id in reserved
+            ):
+                flattened = keyword.value.id
+            else:
+                flattened = allocate(
+                    root, keyword.arg, force_prefix=nested
+                )
+                assignment = ast.Assign(
+                    targets=[ast.Name(id=flattened, ctx=ast.Store())],
+                    value=keyword.value,
+                )
+                emitted.append(ast.copy_location(assignment, location))
+            key_map[keyword.arg] = flattened
+
+        mappings[root] = key_map
+        report.flattened_namespaces[root] = dict(key_map)
+        reconstruction = ast.Assign(
+            targets=[ast.Name(id=root, ctx=ast.Store())],
+            value=ast.Call(
+                func=copy.deepcopy(call.func),
+                args=[],
+                keywords=[
+                    ast.keyword(
+                        arg=keyword.arg,
+                        value=ast.Name(
+                            id=key_map[keyword.arg], ctx=ast.Load()
+                        ),
+                    )
+                    for keyword in call.keywords
+                    if keyword.arg is not None
+                ],
+            ),
+        )
+        return emitted, ast.copy_location(reconstruction, location)
 
     new_body: list[ast.stmt] = []
     for stmt in tree.body:
@@ -315,52 +391,24 @@ def _flatten_simple_namespaces(tree: ast.Module, report: CCForReport) -> ast.Mod
         ):
             call = value
             assert isinstance(call, ast.Call)
-            if call.args or any(keyword.arg is None for keyword in call.keywords):
+            flattened_call = flatten_call(
+                name, call, stmt, nested=False
+            )
+            if flattened_call is None:
                 report.warnings.append(
                     f"Kept namespace {name!r}: positional or ** arguments are not safe to flatten"
                 )
                 new_body.append(stmt)
                 continue
-
-            key_map: dict[str, str] = {}
-            emitted: list[ast.stmt] = []
-            for keyword in call.keywords:
-                assert keyword.arg is not None
-                flattened = allocate(name, keyword.arg)
-                key_map[keyword.arg] = flattened
-                assignment = ast.Assign(
-                    targets=[ast.Name(id=flattened, ctx=ast.Store())],
-                    value=keyword.value,
-                )
-                emitted.append(ast.copy_location(assignment, stmt))
-
-            mappings[name] = key_map
+            emitted, reconstruction = flattened_call
             canonical_roots[name] = name
-            report.flattened_namespaces[name] = dict(key_map)
             new_body.extend(emitted)
             # Keep a symbolic compatibility object after exposing the individual
             # parameters.  Dataset programs often pass the namespace into a class
             # and dereference it through ``self.m`` inside a method.  Removing the
             # object in that case changes runtime semantics even though direct
             # module-level ``m.width`` references can be flattened safely.
-            reconstruction = ast.Assign(
-                targets=[ast.Name(id=name, ctx=ast.Store())],
-                value=ast.Call(
-                    func=copy.deepcopy(call.func),
-                    args=[],
-                    keywords=[
-                        ast.keyword(
-                            arg=keyword.arg,
-                            value=ast.Name(
-                                id=key_map[keyword.arg], ctx=ast.Load()
-                            ),
-                        )
-                        for keyword in call.keywords
-                        if keyword.arg is not None
-                    ],
-                ),
-            )
-            new_body.append(ast.copy_location(reconstruction, stmt))
+            new_body.append(reconstruction)
             continue
 
         if (
@@ -370,6 +418,9 @@ def _flatten_simple_namespaces(tree: ast.Module, report: CCForReport) -> ast.Mod
         ):
             mappings[name] = mappings[value.id]
             canonical_roots[name] = canonical_roots.get(value.id, value.id)
+            # Retain the alias because it may be passed into a class/function even
+            # when all direct ``alias.field`` reads were flattened.
+            new_body.append(stmt)
             continue
 
         new_body.append(stmt)
@@ -1196,6 +1247,102 @@ _NON_GEOMETRY_METHODS = {
     "toTuple",
 }
 
+# Methods whose receiver/result participates in CadQuery's fluent modeling state.
+# This also lets helper functions accept a Workplane under domain names such as
+# ``part`` without requiring fragile interprocedural type inference.
+_CADQUERY_GEOMETRY_METHODS = {
+    "add",
+    "all",
+    "arc",
+    "assemble",
+    "bezier",
+    "box",
+    "cboreHole",
+    "center",
+    "chamfer",
+    "circle",
+    "clean",
+    "close",
+    "combine",
+    "combineSolids",
+    "cone",
+    "copyWorkplane",
+    "cskHole",
+    "cut",
+    "cutBlind",
+    "cutEach",
+    "cutThruAll",
+    "each",
+    "eachpoint",
+    "edge",
+    "edges",
+    "ellipse",
+    "end",
+    "extrude",
+    "face",
+    "faces",
+    "fillet",
+    "findSolid",
+    "first",
+    "fuse",
+    "hLine",
+    "hLineTo",
+    "hole",
+    "hull",
+    "interpPlate",
+    "intersect",
+    "line",
+    "lineTo",
+    "loft",
+    "mirror",
+    "mirrorX",
+    "mirrorY",
+    "move",
+    "moved",
+    "moveTo",
+    "newObject",
+    "offset2D",
+    "parametricCurve",
+    "placeSketch",
+    "polarArray",
+    "polygon",
+    "polyline",
+    "push",
+    "pushPoints",
+    "rarray",
+    "rect",
+    "revolve",
+    "rotate",
+    "rotateAboutCenter",
+    "segment",
+    "shell",
+    "slot",
+    "slot2D",
+    "solid",
+    "solids",
+    "sphere",
+    "spline",
+    "split",
+    "sweep",
+    "tangentArcPoint",
+    "text",
+    "toPending",
+    "translate",
+    "transformed",
+    "trapezoid",
+    "twistExtrude",
+    "union",
+    "vLine",
+    "vLineTo",
+    "val",
+    "vertex",
+    "vertices",
+    "wire",
+    "wires",
+    "workplane",
+    "workplaneFromTagged",
+}
+
 _GEOMETRY_PARAMETER_HINTS = {
     "base",
     "body",
@@ -1274,8 +1421,15 @@ class _WorkplaneLowerer:
         self.result_name = result_name
         self.reserved = _all_bound_names(tree)
         self.index = 0
+        self.helper_index = 0
         self.saw_result = False
         self.geometry_factories = _geometry_factory_names(tree)
+        self.global_result_state: str | None = None
+        if any(
+            isinstance(node, ast.Global) and result_name in node.names
+            for node in ast.walk(tree)
+        ):
+            self.global_result_state = self._state_name(result_name)
 
     def _state_name(self, original: str) -> str:
         """Return a collision-free stable name for loop-carried geometry."""
@@ -1298,6 +1452,14 @@ class _WorkplaneLowerer:
             if name not in self.reserved:
                 self.reserved.add(name)
                 self.report.workplane_steps += 1
+                return name
+
+    def _new_helper(self) -> str:
+        while True:
+            self.helper_index += 1
+            name = f"_cc_for_lambda_{self.helper_index}"
+            if name not in self.reserved:
+                self.reserved.add(name)
                 return name
 
     def _emit_geometry_call(self, call: ast.Call, location: ast.AST) -> tuple[ast.Assign, ast.Name]:
@@ -1332,10 +1494,21 @@ class _WorkplaneLowerer:
                     node.func.value, aliases, dynamic_geometry
                 )
                 prefix.extend(before)
+                method_name = node.func.attr
+                if (
+                    not receiver_is_geometry
+                    and method_name in _CADQUERY_GEOMETRY_METHODS
+                    and isinstance(receiver, ast.Call)
+                ):
+                    assignment, receiver_name = self._emit_geometry_call(
+                        receiver, node.func.value
+                    )
+                    prefix.append(assignment)
+                    receiver = receiver_name
+                    receiver_is_geometry = True
                 function: ast.expr = ast.Attribute(
                     value=receiver, attr=node.func.attr, ctx=ast.Load()
                 )
-                method_name = node.func.attr
             else:
                 function = _rewrite_loads(node.func, aliases)
                 method_name = node.func.id if isinstance(node.func, ast.Name) else ""
@@ -1366,7 +1539,11 @@ class _WorkplaneLowerer:
                 and node.func.attr in self.geometry_factories
             )
             returns_geometry = constructor or (
-                receiver_is_geometry and method_name not in _NON_GEOMETRY_METHODS
+                (
+                    receiver_is_geometry
+                    or method_name in _CADQUERY_GEOMETRY_METHODS
+                )
+                and method_name not in _NON_GEOMETRY_METHODS
             )
             if returns_geometry:
                 assignment, name = self._emit_geometry_call(call, node)
@@ -1408,16 +1585,81 @@ class _WorkplaneLowerer:
             ), is_geometry
 
         if isinstance(node, ast.BinOp):
-            left_prefix, left, _ = self._lower_expr(node.left, aliases, dynamic_geometry)
-            right_prefix, right, _ = self._lower_expr(node.right, aliases, dynamic_geometry)
+            left_prefix, left, left_geometry = self._lower_expr(
+                node.left, aliases, dynamic_geometry
+            )
+            right_prefix, right, right_geometry = self._lower_expr(
+                node.right, aliases, dynamic_geometry
+            )
             return left_prefix + right_prefix, ast.copy_location(
                 ast.BinOp(left=left, op=node.op, right=right), node
+            ), left_geometry or right_geometry
+
+        if isinstance(node, ast.IfExp):
+            test = _rewrite_loads(node.test, aliases)
+            body_prefix, body, body_geometry = self._lower_expr(
+                node.body, aliases, dynamic_geometry
+            )
+            else_prefix, orelse, else_geometry = self._lower_expr(
+                node.orelse, aliases, dynamic_geometry
+            )
+            if body_geometry and else_geometry:
+                wp_name = self._new_wp()
+                body_statements = body_prefix + [
+                    ast.Assign(
+                        targets=[ast.Name(id=wp_name, ctx=ast.Store())],
+                        value=body,
+                    )
+                ]
+                else_statements = else_prefix + [
+                    ast.Assign(
+                        targets=[ast.Name(id=wp_name, ctx=ast.Store())],
+                        value=orelse,
+                    )
+                ]
+                conditional = ast.If(
+                    test=test,
+                    body=body_statements,
+                    orelse=else_statements,
+                )
+                return [ast.copy_location(conditional, node)], ast.Name(
+                    id=wp_name, ctx=ast.Load()
+                ), True
+            # Do not move branch prefixes outside a conditional expression: that
+            # would evaluate an originally lazy branch. Unknown mixed-type cases
+            # stay intact and can be recognized at their next CadQuery use.
+            return [], ast.copy_location(
+                ast.IfExp(
+                    test=test,
+                    body=_rewrite_loads(node.body, aliases),
+                    orelse=_rewrite_loads(node.orelse, aliases),
+                ),
+                node,
             ), False
 
         if isinstance(node, ast.UnaryOp):
             prefix, operand, _ = self._lower_expr(node.operand, aliases, dynamic_geometry)
             return prefix, ast.copy_location(
                 ast.UnaryOp(op=node.op, operand=operand), node
+            ), False
+
+        if isinstance(node, ast.Lambda):
+            body_prefix, body, _ = self._lower_expr(
+                node.body, aliases, dynamic_geometry
+            )
+            if not body_prefix:
+                return [], node, False
+            helper_name = self._new_helper()
+            helper = ast.FunctionDef(
+                name=helper_name,
+                args=copy.deepcopy(node.args),
+                body=body_prefix + [ast.Return(value=body)],
+                decorator_list=[],
+                returns=None,
+                type_comment=None,
+            )
+            return [ast.copy_location(helper, node)], ast.copy_location(
+                ast.Name(id=helper_name, ctx=ast.Load()), node
             ), False
 
         if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
@@ -1751,11 +1993,30 @@ class _WorkplaneLowerer:
                     )
                     if argument.arg in _GEOMETRY_PARAMETER_HINTS
                 }
+                declares_global_result = any(
+                    isinstance(item, ast.Global)
+                    and self.result_name in item.names
+                    for item in stmt.body
+                )
+                initial_dynamic = (
+                    {self.result_name: self.global_result_state}
+                    if declares_global_result
+                    and self.global_result_state is not None
+                    else {}
+                )
+                if declares_global_result and self.global_result_state is not None:
+                    for item in stmt.body:
+                        if (
+                            isinstance(item, ast.Global)
+                            and self.result_name in item.names
+                            and self.global_result_state not in item.names
+                        ):
+                            item.names.append(self.global_result_state)
                 stmt.body, _, _ = self._lower_block(
                     stmt.body,
                     parameter_aliases,
-                    {},
-                    tracks_result=False,
+                    initial_dynamic,
+                    tracks_result=declares_global_result,
                 )
                 if not stmt.body:
                     stmt.body = [ast.copy_location(ast.Pass(), stmt)]
@@ -1828,6 +2089,20 @@ class _WorkplaneLowerer:
                 targets=[ast.Name(id=self.result_name, ctx=ast.Store())],
                 value=ast.Name(id=wp_name, ctx=ast.Load()),
             )
+        elif self.global_result_state is not None:
+            wp_name = self._new_wp()
+            tree.body.append(
+                ast.Assign(
+                    targets=[ast.Name(id=wp_name, ctx=ast.Store())],
+                    value=ast.Name(
+                        id=self.global_result_state, ctx=ast.Load()
+                    ),
+                )
+            )
+            terminal = ast.Assign(
+                targets=[ast.Name(id=self.result_name, ctx=ast.Store())],
+                value=ast.Name(id=wp_name, ctx=ast.Load()),
+            )
         if terminal is not None:
             tree.body.append(terminal)
         elif not self.saw_result:
@@ -1858,9 +2133,15 @@ def _nested_cad_call_count(tree: ast.Module) -> int:
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and isinstance(node.func.value, ast.Call)
+            and node.func.attr not in _NON_GEOMETRY_METHODS
             and (
                 _is_workplane_constructor(node.func.value)
-                or isinstance(node.func.value.func, ast.Attribute)
+                or node.func.attr in _CADQUERY_GEOMETRY_METHODS
+                or (
+                    isinstance(node.func.value.func, ast.Attribute)
+                    and node.func.value.func.attr
+                    in _CADQUERY_GEOMETRY_METHODS
+                )
             )
         ):
             count += 1

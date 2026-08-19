@@ -91,6 +91,30 @@ result = cq.Workplane('XY').box(p.length, p.width, 2)
             "params = Measures(length=length, width=width)", converted.code
         )
 
+    def test_nested_namespaces_become_individual_parameters(self) -> None:
+        converted = canonicalize_code(
+            """
+import cadquery as cq
+from types import SimpleNamespace as Measures
+measures = Measures(
+    panel=Measures(width=80.0, depth=60.0),
+    hole=Measures(diameter=5.0),
+)
+m = measures
+result = cq.Workplane('XY').box(m.panel.width, m.panel.depth, m.hole.diameter)
+"""
+        )
+        self.assertIn("panel_width = 80.0", converted.code)
+        self.assertIn("panel_depth = 60.0", converted.code)
+        self.assertIn("hole_diameter = 5.0", converted.code)
+        self.assertIn(
+            "panel = Measures(width=panel_width, depth=panel_depth)",
+            converted.code,
+        )
+        self.assertIn("m = measures", converted.code)
+        self.assertNotIn("m.panel.width", converted.code)
+        self.assertFalse(converted.report.structural_errors)
+
     def test_class_wrapped_model_keeps_namespace_and_lowers_method(self) -> None:
         source = """
 import cadquery as cq
@@ -135,6 +159,58 @@ result = sketch.extrude(2).edges('|Z').fillet(0.2)
         )
         self.assertRegex(converted.code, r"wp\d+ = profile\(10, 5\)")
         self.assertNotIn("sketch.extrude", converted.code)
+        self.assertFalse(converted.report.structural_errors)
+
+    def test_conditional_geometry_expression_preserves_lazy_branches(self) -> None:
+        converted = canonicalize_code(
+            """
+import cadquery as cq
+base = cq.Workplane('XY').box(10, 5, 2)
+optional = None
+combined = base if optional is None else base.union(optional)
+result = combined.edges('|Z').fillet(0.2)
+"""
+        )
+        self.assertIn("if optional is None:", converted.code)
+        self.assertNotIn("combined = base if", converted.code)
+        self.assertFalse(converted.report.structural_errors)
+
+    def test_global_result_from_class_method_gets_terminal_alias(self) -> None:
+        converted = canonicalize_code(
+            """
+import cadquery as cq
+
+class Part:
+    def build(self):
+        global result
+        result = cq.Workplane('XY').box(10, 5, 2)
+
+Part().build()
+"""
+        )
+        self.assertIn("global result", converted.code)
+        self.assertRegex(converted.code, r"result_state\w* = wp\d+")
+        self.assertRegex(converted.code, r"result = wp\d+\n$")
+        self.assertFalse(converted.report.structural_errors)
+
+    def test_factory_receiver_and_lambda_calls_are_split(self) -> None:
+        converted = canonicalize_code(
+            """
+import cadquery as cq
+
+class Part:
+    def solid(self):
+        return cq.Workplane('XY').box(2, 2, 2)
+
+seed = Part().solid()
+result = cq.Workplane('XY').pushPoints([(0, 0)]).eachpoint(
+    lambda loc: seed.val().located(loc)
+)
+"""
+        )
+        self.assertNotIn("Part().solid()", converted.code)
+        self.assertIn("def _cc_for_lambda_1(loc):", converted.code)
+        self.assertNotIn("lambda loc:", converted.code)
         self.assertFalse(converted.report.structural_errors)
 
     def test_preserved_loop_has_one_terminal_result(self) -> None:
@@ -316,6 +392,21 @@ result = cq.Workplane(plane).box(10, 5, 2)
             source, converted, max_parameters=1
         )
         self.assertTrue(validation.success, validation.to_dict())
+
+    def test_class_wrapper_prefixes_execute(self) -> None:
+        source = """
+import cadquery as cq
+
+class Part:
+    def build(self):
+        base = cq.Workplane('XY').box(10, 5, 2)
+        return base.edges('|Z').fillet(0.2)
+
+result = Part().build()
+"""
+        converted = canonicalize_code(source)
+        prefixes = validate_prefixes(converted.code)
+        self.assertTrue(prefixes.success, prefixes.to_dict())
 
 
 if __name__ == "__main__":
