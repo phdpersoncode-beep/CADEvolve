@@ -31,7 +31,9 @@ The structural pipeline runs in this order:
 
 1. Parse and compile-check the input module.
 2. Flatten top-level `SimpleNamespace` parameter containers when safe, rewriting
-   `p.length` to a collision-free named parameter such as `length`.
+   `p.length` to a collision-free named parameter such as `length`. A symbolic
+   compatibility namespace is retained for class-based programs that pass it through
+   `self.m`, so flattening cannot create a missing runtime binding.
 3. Optionally unroll statically bounded loops over `range`, literal containers,
    `enumerate`, or `zip`. Dynamic and oversized loops stay intact with a warning.
 4. Delete a `name = None` initializer only when the same straight-line block
@@ -40,8 +42,9 @@ The structural pipeline runs in this order:
    name receives a suffix, including the first definition.
 6. Hoist pure, CAD-independent assignments into a dependency-safe parameter preamble.
    Loop-local and loop-mutated values stay with their loop in preserve mode.
-7. Lower CadQuery Workplane chains without executing them. `cq.Plane`, `cq.Vector`,
-   trigonometry, and other parameter expressions remain symbolic.
+7. Lower CadQuery Workplane, Sketch, and shape-factory chains without executing them,
+   including chains inside helper functions and class methods. `cq.Plane`,
+   `cq.Vector`, trigonometry, and other parameter expressions remain symbolic.
 8. Reparse, compile, run structural checks, and optionally execute the original and
    canonical programs for geometric round-trip and prefix validation.
 
@@ -93,4 +96,3 @@ CC-for conversion preserves the source geometry exactly. The legacy dynamic
 removes symbols, and its scaler multiplies dimensionless values such as counts and
 angles. Centering/scaling must therefore remain a separately validated, unit-aware
 stage rather than being silently mixed into structural canonicalization.
-

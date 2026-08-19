@@ -35,6 +35,48 @@ Usable results are stored in:
 
 Important: the rotation stage expects a flat folder at `results/canonicalized_flat/`.
 
+## Parameter-preserving CC-for output
+
+The legacy `standardize -> center -> scale -> binarize` route creates CADEvolve-C by
+executing programs and recording concrete calls. Do not use that route when named
+parameter relationships are required.
+
+`canonicalization_run/cc_for_pipeline.py` converts sampled CADEvolve-P scripts (or a
+folder of readable Zero-to-CAD scripts) directly into the Step-ToCAD CC-for format:
+
+```bash
+cd results
+PYTHONPATH=.. python ../canonicalization_run/cc_for_pipeline.py \
+  --config ../canonicalization_run/cfg_cc_for.yaml
+```
+
+Edit `cfg_cc_for.yaml` to point `root_dir` at the source scripts. The default
+`loop_mode: preserve` keeps pattern loops intact; `loop_mode: unroll` expands bounded
+static loops and produces strict reaching-definition names. Geometry round-trip and
+executable-prefix validation are enabled by default. Per-file records are written to
+`logs/cc_for.jsonl`, with aggregate counts in `logs/cc_for.summary.json`.
+
+The converter intentionally preserves source coordinates and scale. Unit-aware
+centering/scaling is a separate stage; running the legacy tracer or scalar rewriter
+after CC-for would destroy parameters or incorrectly scale counts and angles.
+
+### Zero-to-CAD 100K validation
+
+The Hugging Face stress runner reads only the `uuid` and `cadquery_file` Parquet
+columns. Images, STL, and STEP fields are not materialized:
+
+```bash
+PYTHONPATH=. python canonicalization_run/zero_to_cad_hf_validation.py \
+  --split train \
+  --loop-mode preserve \
+  --execution-samples 100 \
+  --report logs/zero_to_cad_100k_preserve.json
+```
+
+Use `--max-rows` or `--max-shards` for a smoke run. The JSON report includes the
+dataset revision, strict structural pass rate, aggregate transformations and
+warnings, bounded failure examples, and optional geometry round-trip results.
+
 ## Notes on config paths
 
 - `run.sh` executes stages with the working directory set to `./results/`, so paths inside YAML configs are resolved relative to `./results/`.

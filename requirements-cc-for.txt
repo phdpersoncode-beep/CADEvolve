@@ -1,0 +1,8 @@
+# Minimal CC-for conversion and validation environment.
+cadquery==2.5.2
+PyYAML>=6.0,<7
+pytest>=8,<10
+
+# Remote Zero-to-CAD Parquet projection benchmark.
+duckdb>=1.5,<2
+requests[socks]>=2.32,<3

@@ -338,6 +338,29 @@ def _flatten_simple_namespaces(tree: ast.Module, report: CCForReport) -> ast.Mod
             canonical_roots[name] = name
             report.flattened_namespaces[name] = dict(key_map)
             new_body.extend(emitted)
+            # Keep a symbolic compatibility object after exposing the individual
+            # parameters.  Dataset programs often pass the namespace into a class
+            # and dereference it through ``self.m`` inside a method.  Removing the
+            # object in that case changes runtime semantics even though direct
+            # module-level ``m.width`` references can be flattened safely.
+            reconstruction = ast.Assign(
+                targets=[ast.Name(id=name, ctx=ast.Store())],
+                value=ast.Call(
+                    func=copy.deepcopy(call.func),
+                    args=[],
+                    keywords=[
+                        ast.keyword(
+                            arg=keyword.arg,
+                            value=ast.Name(
+                                id=key_map[keyword.arg], ctx=ast.Load()
+                            ),
+                        )
+                        for keyword in call.keywords
+                        if keyword.arg is not None
+                    ],
+                ),
+            )
+            new_body.append(ast.copy_location(reconstruction, stmt))
             continue
 
         if (
@@ -777,14 +800,16 @@ class _ProtectedNameCollector(ast.NodeVisitor):
 
 
 class _SSARenamer:
-    def __init__(self, tree: ast.Module, report: CCForReport) -> None:
+    def __init__(
+        self, tree: ast.Module, report: CCForReport, result_name: str
+    ) -> None:
         counter = _DefinitionCounter()
         counter.visit(tree)
         protected = _ProtectedNameCollector()
         protected.visit(tree)
 
         self.repeated = {name for name, count in counter.counts.items() if count > 1}
-        self.protected = protected.protected
+        self.protected = protected.protected | {result_name}
         self.report = report
         self.report.loop_carried_names = sorted(protected.loop_carried)
         self.next_index: defaultdict[str, int] = defaultdict(int)
@@ -971,16 +996,44 @@ def _is_pure_data_expression(node: ast.AST, geometry_names: set[str]) -> bool:
     return visitor.pure
 
 
+_DIRECT_GEOMETRY_CONSTRUCTORS = {"Sketch", "Workplane"}
+_GEOMETRY_FACTORY_TYPES = {
+    "Compound",
+    "Edge",
+    "Face",
+    "Shape",
+    "Shell",
+    "Solid",
+    "Vertex",
+    "Wire",
+}
+
+
 def _is_workplane_constructor(node: ast.AST) -> bool:
+    """Recognize CadQuery objects that start a fluent geometry chain.
+
+    The historical helper name is retained for compatibility inside this module,
+    but Zero-to-CAD also uses ``cq.Sketch()`` and factories such as
+    ``cq.Solid.makeCone(...)`` as chain roots.
+    """
+
     if not isinstance(node, ast.Call):
         return False
     if isinstance(node.func, ast.Name):
-        return node.func.id == "Workplane"
-    return (
+        return node.func.id in _DIRECT_GEOMETRY_CONSTRUCTORS
+    if (
         isinstance(node.func, ast.Attribute)
         and isinstance(node.func.value, ast.Name)
         and node.func.value.id == "cq"
-        and node.func.attr == "Workplane"
+        and node.func.attr in _DIRECT_GEOMETRY_CONSTRUCTORS
+    ):
+        return True
+    return (
+        isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Attribute)
+        and isinstance(node.func.value.value, ast.Name)
+        and node.func.value.value.id == "cq"
+        and node.func.value.attr in _GEOMETRY_FACTORY_TYPES
     )
 
 
@@ -1051,8 +1104,7 @@ class _ControlFlowMutationCollector(ast.NodeVisitor):
 
     def visit_Expr(self, node: ast.Expr) -> None:
         if (
-            self.depth
-            and isinstance(node.value, ast.Call)
+            isinstance(node.value, ast.Call)
             and isinstance(node.value.func, ast.Attribute)
             and node.value.func.attr in {"add", "append", "extend", "insert", "update"}
             and isinstance(node.value.func.value, ast.Name)
@@ -1144,6 +1196,77 @@ _NON_GEOMETRY_METHODS = {
     "toTuple",
 }
 
+_GEOMETRY_PARAMETER_HINTS = {
+    "base",
+    "body",
+    "model",
+    "part",
+    "result",
+    "shape",
+    "solid",
+    "workplane",
+    "wp",
+}
+_GEOMETRY_ATTRIBUTE_HINTS = {
+    "base",
+    "body",
+    "model",
+    "panel",
+    "part",
+    "result",
+    "shape",
+    "solid",
+    "workplane",
+    "wp",
+}
+
+
+def _state_key(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        parent = _state_key(node.value)
+        if parent is not None:
+            return f"{parent}.{node.attr}"
+    return None
+
+
+def _geometry_factory_names(tree: ast.AST) -> set[str]:
+    """Find helpers that return a value built in a CadQuery geometry scope."""
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        has_value_return = any(
+            isinstance(child, ast.Return) and child.value is not None
+            for child in ast.walk(node)
+        )
+        starts_geometry = any(
+            isinstance(child, ast.Call) and _is_workplane_constructor(child)
+            for child in ast.walk(node)
+        )
+        arguments = {
+            argument.arg
+            for argument in (
+                list(node.args.posonlyargs)
+                + list(node.args.args)
+                + list(node.args.kwonlyargs)
+            )
+        }
+        transforms_geometry_argument = bool(
+            arguments & _GEOMETRY_PARAMETER_HINTS
+        ) and any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            for child in ast.walk(node)
+        )
+        if has_value_return and (
+            starts_geometry or transforms_geometry_argument
+        ):
+            names.add(node.name)
+    return names
+
 
 class _WorkplaneLowerer:
     def __init__(self, tree: ast.Module, report: CCForReport, result_name: str) -> None:
@@ -1152,6 +1275,7 @@ class _WorkplaneLowerer:
         self.reserved = _all_bound_names(tree)
         self.index = 0
         self.saw_result = False
+        self.geometry_factories = _geometry_factory_names(tree)
 
     def _state_name(self, original: str) -> str:
         """Return a collision-free stable name for loop-carried geometry."""
@@ -1175,10 +1299,6 @@ class _WorkplaneLowerer:
                 self.reserved.add(name)
                 self.report.workplane_steps += 1
                 return name
-
-    @staticmethod
-    def _name(node: ast.AST, ctx: ast.expr_context | None = None) -> ast.Name:
-        return ast.Name(id=str(node), ctx=ctx or ast.Load())
 
     def _emit_geometry_call(self, call: ast.Call, location: ast.AST) -> tuple[ast.Assign, ast.Name]:
         name = self._new_wp()
@@ -1238,7 +1358,13 @@ class _WorkplaneLowerer:
 
             call = ast.Call(func=function, args=arguments, keywords=keywords)
             ast.copy_location(call, node)
-            constructor = _is_workplane_constructor(call)
+            constructor = _is_workplane_constructor(call) or (
+                isinstance(node.func, ast.Name)
+                and node.func.id in self.geometry_factories
+            ) or (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr in self.geometry_factories
+            )
             returns_geometry = constructor or (
                 receiver_is_geometry and method_name not in _NON_GEOMETRY_METHODS
             )
@@ -1249,9 +1375,25 @@ class _WorkplaneLowerer:
             return prefix, call, False
 
         if isinstance(node, ast.Attribute):
+            key = _state_key(node)
+            if isinstance(node.ctx, ast.Load) and key is not None:
+                if key in aliases:
+                    return [], ast.copy_location(
+                        ast.Name(id=aliases[key], ctx=ast.Load()), node
+                    ), True
+                if key in dynamic_geometry:
+                    return [], ast.copy_location(
+                        ast.Name(id=dynamic_geometry[key], ctx=ast.Load()), node
+                    ), True
             prefix, value, is_geometry = self._lower_expr(
                 node.value, aliases, dynamic_geometry
             )
+            if (
+                key is not None
+                and key.startswith("self.")
+                and node.attr in _GEOMETRY_ATTRIBUTE_HINTS
+            ):
+                is_geometry = True
             return prefix, ast.copy_location(
                 ast.Attribute(value=value, attr=node.attr, ctx=node.ctx), node
             ), is_geometry
@@ -1334,6 +1476,8 @@ class _WorkplaneLowerer:
         statements: Sequence[ast.stmt],
         initial_aliases: Mapping[str, str],
         initial_dynamic: Mapping[str, str],
+        *,
+        tracks_result: bool = True,
     ) -> tuple[list[ast.stmt], dict[str, str], dict[str, str]]:
         aliases = dict(initial_aliases)
         dynamic = dict(initial_dynamic)
@@ -1349,6 +1493,22 @@ class _WorkplaneLowerer:
                 if isinstance(target, ast.Name):
                     name = target.id
                     if is_geometry:
+                        if not isinstance(value, ast.Name):
+                            wp_name = self._new_wp()
+                            output.append(
+                                ast.copy_location(
+                                    ast.Assign(
+                                        targets=[
+                                            ast.Name(
+                                                id=wp_name, ctx=ast.Store()
+                                            )
+                                        ],
+                                        value=value,
+                                    ),
+                                    stmt,
+                                )
+                            )
+                            value = ast.Name(id=wp_name, ctx=ast.Load())
                         assert isinstance(value, ast.Name)
                         if name in dynamic:
                             output.append(
@@ -1364,16 +1524,51 @@ class _WorkplaneLowerer:
                             )
                         else:
                             aliases[name] = value.id
-                        if name == self.result_name:
+                        if tracks_result and name == self.result_name:
                             self.saw_result = True
+                        continue
+                    if tracks_result and name == self.result_name:
+                        # A factory/class expression can return a Workplane without
+                        # looking like a CadQuery call statically.  Give it an
+                        # explicit state name and still suppress all non-terminal
+                        # ``result`` definitions.
+                        wp_name = self._new_wp()
+                        output.append(
+                            ast.copy_location(
+                                ast.Assign(
+                                    targets=[
+                                        ast.Name(id=wp_name, ctx=ast.Store())
+                                    ],
+                                    value=value,
+                                ),
+                                stmt,
+                            )
+                        )
+                        if name in dynamic:
+                            output.append(
+                                ast.copy_location(
+                                    ast.Assign(
+                                        targets=[
+                                            ast.Name(
+                                                id=dynamic[name], ctx=ast.Store()
+                                            )
+                                        ],
+                                        value=ast.Name(
+                                            id=wp_name, ctx=ast.Load()
+                                        ),
+                                    ),
+                                    stmt,
+                                )
+                            )
+                        else:
+                            aliases[name] = wp_name
+                        self.saw_result = True
                         continue
                     aliases.pop(name, None)
                     if name in dynamic:
                         dynamic.pop(name)
                     stmt.value = value
                     output.append(stmt)
-                    if name == self.result_name:
-                        self.saw_result = True
                     continue
 
                 stmt.value = value
@@ -1381,6 +1576,14 @@ class _WorkplaneLowerer:
                     _rewrite_loads(target, aliases) for target in stmt.targets
                 ]
                 output.append(stmt)
+                key = _state_key(target)
+                if key is not None:
+                    if is_geometry and isinstance(value, ast.Name):
+                        aliases[key] = value.id
+                        dynamic.pop(key, None)
+                    else:
+                        aliases.pop(key, None)
+                        dynamic.pop(key, None)
                 continue
 
             if isinstance(stmt, ast.AnnAssign):
@@ -1390,6 +1593,22 @@ class _WorkplaneLowerer:
                     )
                     output.extend(prefix)
                     if isinstance(stmt.target, ast.Name) and is_geometry:
+                        if not isinstance(value, ast.Name):
+                            wp_name = self._new_wp()
+                            output.append(
+                                ast.copy_location(
+                                    ast.Assign(
+                                        targets=[
+                                            ast.Name(
+                                                id=wp_name, ctx=ast.Store()
+                                            )
+                                        ],
+                                        value=value,
+                                    ),
+                                    stmt,
+                                )
+                            )
+                            value = ast.Name(id=wp_name, ctx=ast.Load())
                         assert isinstance(value, ast.Name)
                         aliases[stmt.target.id] = value.id
                         continue
@@ -1407,9 +1626,19 @@ class _WorkplaneLowerer:
 
                 stmt.iter = _rewrite_loads(stmt.iter, aliases)
                 stmt.body, body_aliases, body_dynamic = self._lower_block(
-                    stmt.body, aliases, dynamic
+                    stmt.body,
+                    aliases,
+                    dynamic,
+                    tracks_result=tracks_result,
                 )
-                stmt.orelse, _, _ = self._lower_block(stmt.orelse, aliases, dynamic)
+                stmt.orelse, _, _ = self._lower_block(
+                    stmt.orelse,
+                    aliases,
+                    dynamic,
+                    tracks_result=tracks_result,
+                )
+                if not stmt.body:
+                    stmt.body = [ast.copy_location(ast.Pass(), stmt)]
                 for name in assigned:
                     if name in body_dynamic:
                         dynamic[name] = body_dynamic[name]
@@ -1426,25 +1655,139 @@ class _WorkplaneLowerer:
                     if initializer is not None:
                         output.append(ast.copy_location(initializer, stmt))
                 stmt.test = _rewrite_loads(stmt.test, aliases)
-                stmt.body, _, _ = self._lower_block(stmt.body, aliases, dynamic)
-                stmt.orelse, _, _ = self._lower_block(stmt.orelse, aliases, dynamic)
+                stmt.body, _, _ = self._lower_block(
+                    stmt.body,
+                    aliases,
+                    dynamic,
+                    tracks_result=tracks_result,
+                )
+                stmt.orelse, _, _ = self._lower_block(
+                    stmt.orelse,
+                    aliases,
+                    dynamic,
+                    tracks_result=tracks_result,
+                )
+                if not stmt.body:
+                    stmt.body = [ast.copy_location(ast.Pass(), stmt)]
                 output.append(stmt)
                 continue
 
             if isinstance(stmt, ast.If):
                 assigned = _assigned_names(stmt)
+                had_else = bool(stmt.orelse)
                 for name in sorted(assigned & set(aliases)):
                     initializer = self._materialize_alias(name, aliases, dynamic)
                     if initializer is not None:
                         output.append(ast.copy_location(initializer, stmt))
                 stmt.test = _rewrite_loads(stmt.test, aliases)
-                stmt.body, _, _ = self._lower_block(stmt.body, aliases, dynamic)
-                stmt.orelse, _, _ = self._lower_block(stmt.orelse, aliases, dynamic)
+                stmt.body, body_aliases, body_dynamic = self._lower_block(
+                    stmt.body,
+                    aliases,
+                    dynamic,
+                    tracks_result=tracks_result,
+                )
+                stmt.orelse, else_aliases, else_dynamic = self._lower_block(
+                    stmt.orelse,
+                    aliases,
+                    dynamic,
+                    tracks_result=tracks_result,
+                )
+                if not stmt.body:
+                    stmt.body = [ast.copy_location(ast.Pass(), stmt)]
+                if had_else and not stmt.orelse:
+                    stmt.orelse = [ast.copy_location(ast.Pass(), stmt)]
+                if had_else:
+                    for name in sorted(assigned):
+                        body_name = body_dynamic.get(name) or body_aliases.get(name)
+                        else_name = else_dynamic.get(name) or else_aliases.get(name)
+                        if body_name is None or else_name is None:
+                            continue
+                        stable_name = dynamic.setdefault(
+                            name, self._state_name(name)
+                        )
+                        aliases.pop(name, None)
+                        if body_name != stable_name:
+                            stmt.body.append(
+                                ast.copy_location(
+                                    ast.Assign(
+                                        targets=[
+                                            ast.Name(
+                                                id=stable_name, ctx=ast.Store()
+                                            )
+                                        ],
+                                        value=ast.Name(
+                                            id=body_name, ctx=ast.Load()
+                                        ),
+                                    ),
+                                    stmt,
+                                )
+                            )
+                        if else_name != stable_name:
+                            stmt.orelse.append(
+                                ast.copy_location(
+                                    ast.Assign(
+                                        targets=[
+                                            ast.Name(
+                                                id=stable_name, ctx=ast.Store()
+                                            )
+                                        ],
+                                        value=ast.Name(
+                                            id=else_name, ctx=ast.Load()
+                                        ),
+                                    ),
+                                    stmt,
+                                )
+                            )
                 output.append(stmt)
                 continue
 
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                parameter_aliases = {
+                    argument.arg: argument.arg
+                    for argument in (
+                        list(stmt.args.posonlyargs)
+                        + list(stmt.args.args)
+                        + list(stmt.args.kwonlyargs)
+                    )
+                    if argument.arg in _GEOMETRY_PARAMETER_HINTS
+                }
+                stmt.body, _, _ = self._lower_block(
+                    stmt.body,
+                    parameter_aliases,
+                    {},
+                    tracks_result=False,
+                )
+                if not stmt.body:
+                    stmt.body = [ast.copy_location(ast.Pass(), stmt)]
                 output.append(stmt)
+                continue
+
+            if isinstance(stmt, ast.ClassDef):
+                stmt.body, _, _ = self._lower_block(
+                    stmt.body, {}, {}, tracks_result=False
+                )
+                if not stmt.body:
+                    stmt.body = [ast.copy_location(ast.Pass(), stmt)]
+                output.append(stmt)
+                continue
+
+            if isinstance(stmt, ast.Return) and stmt.value is not None:
+                prefix, value, _ = self._lower_expr(
+                    stmt.value, aliases, dynamic
+                )
+                output.extend(prefix)
+                stmt.value = value
+                output.append(stmt)
+                continue
+
+            if isinstance(stmt, ast.Expr):
+                prefix, value, is_geometry = self._lower_expr(
+                    stmt.value, aliases, dynamic
+                )
+                output.extend(prefix)
+                if not is_geometry:
+                    stmt.value = value
+                    output.append(stmt)
                 continue
 
             output.append(_rewrite_loads(stmt, aliases))
@@ -1452,12 +1795,26 @@ class _WorkplaneLowerer:
         return output, aliases, dynamic
 
     def transform(self, tree: ast.Module) -> ast.Module:
-        tree.body, aliases, dynamic = self._lower_block(tree.body, {}, {})
+        tree.body, aliases, dynamic = self._lower_block(
+            tree.body, {}, {}, tracks_result=True
+        )
         terminal: ast.stmt | None = None
         if self.result_name in aliases:
+            final_name = aliases[self.result_name]
+            if not (
+                final_name.startswith("wp") and final_name[2:].isdigit()
+            ):
+                wp_name = self._new_wp()
+                tree.body.append(
+                    ast.Assign(
+                        targets=[ast.Name(id=wp_name, ctx=ast.Store())],
+                        value=ast.Name(id=final_name, ctx=ast.Load()),
+                    )
+                )
+                final_name = wp_name
             terminal = ast.Assign(
                 targets=[ast.Name(id=self.result_name, ctx=ast.Store())],
-                value=ast.Name(id=aliases[self.result_name], ctx=ast.Load()),
+                value=ast.Name(id=final_name, ctx=ast.Load()),
             )
         elif self.result_name in dynamic:
             wp_name = self._new_wp()
@@ -1560,7 +1917,7 @@ def canonicalize_code(
         tree.body = _remove_dead_none_from_block(tree.body, report)
 
     if config.version_reassignments:
-        tree = _SSARenamer(tree, report).transform(tree)
+        tree = _SSARenamer(tree, report, config.result_name).transform(tree)
 
     if config.hoist_parameters:
         tree = _hoist_parameter_assignments(tree, report, config.result_name)

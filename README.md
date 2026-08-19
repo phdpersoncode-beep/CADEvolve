@@ -68,6 +68,16 @@ cd dataset_utils
 # See dataset_utils/README.md for the exact pipeline and arguments
 ``` 
 
+For parameter-preserving Step-ToCAD data, use the CC-for batch converter documented
+in [`docs/cc_for_canonicalization.md`](docs/cc_for_canonicalization.md). It keeps named
+parameters and loops while lowering CadQuery chains to explicit `wpN` steps.
+
+Install only the converter and validation dependencies with:
+
+```bash
+pip install -r requirements-cc-for.txt
+```
+
 ### 3) Train / infer / evaluate (Image2CAD VLM)
 
 All training utilities live in `train/`.
