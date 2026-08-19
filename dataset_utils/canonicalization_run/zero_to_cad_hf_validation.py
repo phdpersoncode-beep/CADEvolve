@@ -47,6 +47,8 @@ class CorpusReport:
     splits: list[str]
     started_at: str
     parquet_shards: int = 0
+    skipped_shards: int = 0
+    processed_shards: int = 0
     projected_columns: list[str] = field(
         default_factory=lambda: ["uuid", "cadquery_file"]
     )
@@ -167,12 +169,30 @@ def _record_failure(
     uuid: str,
     split: str,
     errors: Iterable[str],
+    row_index: int,
+    shard_batch: str,
 ) -> None:
     if len(failures) >= maximum:
         return
     failures.append(
-        {"uuid": uuid, "split": split, "errors": list(errors)}
+        {
+            "uuid": uuid,
+            "split": split,
+            "row_index": row_index,
+            "shard_batch": shard_batch,
+            "errors": list(errors),
+        }
     )
+
+
+def _write_failure_source(
+    directory: Path | None, split: str, uuid: str, source: str
+) -> None:
+    if directory is None:
+        return
+    destination = directory / split / f"{uuid}.py"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(source, encoding="utf-8")
 
 
 def _atomic_json(path: Path, payload: Any) -> None:
@@ -191,6 +211,24 @@ def _atomic_json(path: Path, payload: Any) -> None:
         raise
 
 
+def _report_payload(
+    report: CorpusReport,
+    failures: Sequence[dict[str, Any]],
+    execution_failures: Sequence[dict[str, Any]],
+    *,
+    complete: bool,
+) -> dict[str, Any]:
+    """Build a durable report for both partial and completed corpus scans."""
+
+    return {
+        "complete": complete,
+        "next_shard_offset": report.skipped_shards + report.processed_shards,
+        "summary": report.to_dict(),
+        "failure_examples": list(failures),
+        "execution_failures": list(execution_failures),
+    }
+
+
 def validate_corpus(
     *,
     dataset: str,
@@ -199,6 +237,7 @@ def validate_corpus(
     report_path: Path,
     max_rows: int | None = None,
     max_shards: int | None = None,
+    skip_shards: int = 0,
     shard_batch_size: int = 8,
     fetch_size: int = 512,
     threads: int = 8,
@@ -210,6 +249,7 @@ def validate_corpus(
     extension_directory: Path | None = None,
     shard_retries: int = 2,
     progress: bool = False,
+    failure_source_dir: Path | None = None,
 ) -> dict[str, Any]:
     started = time.monotonic()
     revision, manifest = fetch_parquet_manifest(dataset)
@@ -221,6 +261,7 @@ def validate_corpus(
             key=lambda item: item.filename,
         )
     ]
+    selected = selected[max(0, skip_shards) :]
     if max_shards is not None:
         selected = selected[:max_shards]
     if not selected:
@@ -235,6 +276,7 @@ def validate_corpus(
         splits=list(splits),
         started_at=datetime.now(UTC).isoformat(),
         parquet_shards=len(selected),
+        skipped_shards=max(0, skip_shards),
     )
     failures: list[dict[str, Any]] = []
     reservoir: list[tuple[str, str, str]] = []
@@ -269,6 +311,14 @@ def validate_corpus(
                     f"{split}/{batch[0].filename}..{batch[-1].filename}: "
                     f"{type(last_error).__name__}: {last_error}"
                 )
+                report.processed_shards += len(batch)
+                report.elapsed_seconds = round(time.monotonic() - started, 6)
+                _atomic_json(
+                    report_path,
+                    _report_payload(
+                        report, failures, [], complete=False
+                    ),
+                )
                 continue
 
             for uuid, encoded_code in batch_rows:
@@ -276,6 +326,8 @@ def validate_corpus(
                     stop = True
                     break
                 report.rows += 1
+                source: str | None = None
+                shard_batch = f"{batch[0].filename}..{batch[-1].filename}"
                 try:
                     source = _decode_code(encoded_code)
                     report.source_bytes += len(source.encode("utf-8"))
@@ -308,6 +360,11 @@ def validate_corpus(
                             uuid=str(uuid),
                             split=split,
                             errors=conversion_report.structural_errors,
+                            row_index=report.rows - 1,
+                            shard_batch=shard_batch,
+                        )
+                        _write_failure_source(
+                            failure_source_dir, split, str(uuid), source
                         )
                         continue
                     report.structural_passed += 1
@@ -331,7 +388,13 @@ def validate_corpus(
                         uuid=str(uuid),
                         split=split,
                         errors=[message],
+                        row_index=report.rows - 1,
+                        shard_batch=shard_batch,
                     )
+                    if source is not None:
+                        _write_failure_source(
+                            failure_source_dir, split, str(uuid), source
+                        )
             if progress:
                 print(
                     f"validated={report.rows} "
@@ -340,6 +403,13 @@ def validate_corpus(
                     file=sys.stderr,
                     flush=True,
                 )
+            if not stop:
+                report.processed_shards += len(batch)
+            report.elapsed_seconds = round(time.monotonic() - started, 6)
+            _atomic_json(
+                report_path,
+                _report_payload(report, failures, [], complete=False),
+            )
 
     report.execution_sample_size = len(reservoir)
     execution_failures: list[dict[str, Any]] = []
@@ -363,11 +433,12 @@ def validate_corpus(
                 )
 
     report.elapsed_seconds = round(time.monotonic() - started, 6)
-    payload = {
-        "summary": report.to_dict(),
-        "failure_examples": failures,
-        "execution_failures": execution_failures,
-    }
+    payload = _report_payload(
+        report,
+        failures,
+        execution_failures,
+        complete=not report.shard_errors,
+    )
     _atomic_json(report_path, payload)
     return payload
 
@@ -390,6 +461,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--max-rows", type=int)
     parser.add_argument("--max-shards", type=int)
+    parser.add_argument("--skip-shards", type=int, default=0)
     parser.add_argument("--shard-batch-size", type=int, default=8)
     parser.add_argument("--fetch-size", type=int, default=512)
     parser.add_argument("--threads", type=int, default=8)
@@ -401,6 +473,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--extension-directory", type=Path)
     parser.add_argument("--shard-retries", type=int, default=2)
     parser.add_argument("--progress", action="store_true")
+    parser.add_argument("--failure-source-dir", type=Path)
     return parser.parse_args()
 
 
@@ -413,6 +486,7 @@ def main() -> None:
         report_path=args.report,
         max_rows=args.max_rows,
         max_shards=args.max_shards,
+        skip_shards=args.skip_shards,
         shard_batch_size=args.shard_batch_size,
         fetch_size=args.fetch_size,
         threads=args.threads,
@@ -424,6 +498,7 @@ def main() -> None:
         extension_directory=args.extension_directory,
         shard_retries=args.shard_retries,
         progress=args.progress,
+        failure_source_dir=args.failure_source_dir,
     )
     summary = payload["summary"]
     console_summary = {

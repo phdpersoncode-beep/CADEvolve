@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import json
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from dataset_utils.canonicalization_run import zero_to_cad_hf_validation
 from dataset_utils.utils.canonicalization.cc_for import (
     CCForConfig,
     canonicalize_code,
@@ -42,6 +46,60 @@ def assignment_counts(code: str) -> dict[str, int]:
 
 
 class CCForStructuralTests(unittest.TestCase):
+    def test_hf_runner_checkpoints_after_each_completed_batch(self) -> None:
+        source = "import cadquery as cq\nresult = cq.Workplane('XY').box(1, 1, 1)\n"
+        shards = [
+            zero_to_cad_hf_validation.ParquetShard(
+                split="train",
+                filename=f"part-{index}.parquet",
+                url=f"https://example.invalid/part-{index}.parquet",
+                size=1,
+            )
+            for index in range(2)
+        ]
+        reads = iter([[("first", source)], KeyboardInterrupt()])
+
+        def read_rows(*_args: object, **_kwargs: object):
+            value = next(reads)
+            if isinstance(value, BaseException):
+                raise value
+            yield from value
+
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "report.json"
+            with (
+                mock.patch.object(
+                    zero_to_cad_hf_validation,
+                    "fetch_parquet_manifest",
+                    return_value=("revision", shards),
+                ),
+                mock.patch.object(
+                    zero_to_cad_hf_validation,
+                    "_open_duckdb",
+                    return_value=object(),
+                ),
+                mock.patch.object(
+                    zero_to_cad_hf_validation,
+                    "_read_projected_rows",
+                    side_effect=read_rows,
+                ),
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    zero_to_cad_hf_validation.validate_corpus(
+                        dataset="fixture",
+                        splits=["train"],
+                        loop_mode="preserve",
+                        report_path=report_path,
+                        shard_batch_size=1,
+                        shard_retries=0,
+                    )
+
+            checkpoint = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertFalse(checkpoint["complete"])
+            self.assertEqual(checkpoint["next_shard_offset"], 1)
+            self.assertEqual(checkpoint["summary"]["processed_shards"], 1)
+            self.assertEqual(checkpoint["summary"]["rows"], 1)
+
     def test_reassignments_receive_reaching_definition_names(self) -> None:
         converted = canonicalize_code(
             """
