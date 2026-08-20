@@ -86,6 +86,14 @@ regression work.
 The reproducible Zero-to-CAD validation results and metric definitions are in
 [`docs/cc_for_zero_to_cad_validation.md`](../docs/cc_for_zero_to_cad_validation.md).
 
+### Offline Zero-to-CAD 5K demo snapshot
+
+`demo_data/zero_to_cad_5k/raw_sources.tar.gz` contains 5,000 raw CadQuery
+programs for repeatable offline structural tests. See its
+[`README.md`](../demo_data/zero_to_cad_5k/README.md) for extraction, validation,
+and provenance-reproduction commands. The archive avoids adding 5,000 loose Git
+objects while still extracting to ordinary `<uuid>.py` source files.
+
 ## Notes on config paths
 
 - `run.sh` executes stages with the working directory set to `./results/`, so paths inside YAML configs are resolved relative to `./results/`.
