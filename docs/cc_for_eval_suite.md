@@ -36,19 +36,49 @@ Preamble coverage (share of a program's numeric design parameters bound by name
 in the canonical preamble, n=4,711 programs that have any): mean **0.9951**,
 median 1.0. 2,082 loops preserved, 110,696 explicit workplane steps emitted.
 
-Geometry, 250-program sample with every gate (see the run summary at the end of
-this document for the final numbers) plus all 22 edge cases:
+Geometry, 250-program sample with every gate (24 edge cases give the same
+picture, and are covered under *Defects* below):
+
+| Gate | Result |
+|---|---|
+| `topology_identical` | 241 / 241 |
+| `shape_identical` | 241 / 241 |
+| `prefixes_execute` | 241 / 241 |
+| `quantization_commutes` | 241 / 241 |
+| `quantized_shape_close` | 241 / 241 |
+| `parameter_perturbation` | 241 / 241 |
+
+Nine programs are excluded from the comparison gates: eight fail to build *as
+source programs* and one is not reproducible (see the reproducibility section).
+Exact voxel IoU: mean **0.99998**, median 1.0. Exact Chamfer: median **0**,
+p95 0.0007.
 
 - **Exact solid equivalence.** Source and canonical agree on solid, shell, face,
   wire, edge and vertex counts, on face and edge *type* histograms, and on
-  volume, area, bounding box and centre of mass. Voxel IoU is 1.0 and the
-  surface Chamfer sits below the sampling noise floor.
+  volume, area, bounding box and centre of mass.
 - **Action prefixes execute.** Every emitted `wpN` prefix runs standalone.
 - **Binarization commutes.** Binarizing the source and binarizing the canonical
   program give the same solid wherever the binarizer can build either.
 - **Parameter perturbation is consistent.** Scaling a named parameter by 1.37 in
   the source and in the canonical program produces the same solid — the check
   that the symbolic relationships are genuinely intact rather than frozen.
+
+Of the 250 programs, **240 pass** with the corpus-wide `idempotent` defect
+baselined out. Every one of the 10 failures is individually accounted for:
+
+| Cause | Programs |
+|---|---:|
+| Corpus program fails to build as *source* (fails identically as canonical) | 5 |
+| Corpus program is not reproducible | 1 |
+| **Defect 1** — `AugAssign` → `NameError` | 1 |
+| **Defect 3** — silent geometry loss | 1 |
+| **Defect 5** — hand-rolled `Measures` class not flattened | 1 |
+| **Defect 5** — same program, second gate | (1) |
+
+Three programs fail for canonicalization reasons; the other seven are corpus
+quality. Defect 2 does not appear in this particular sample because the program
+carrying it (`019172f8`) failed to build as a source on this run — it has a
+deterministic minimal reproduction above.
 
 ## Defects
 
