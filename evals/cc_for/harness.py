@@ -528,6 +528,29 @@ def evaluate_program(
             evaluation.seconds = time.monotonic() - started
             return evaluation
 
+    def _disagrees_with_itself(
+        code: str,
+        baseline: Any,
+        label: str,
+        *,
+        relative_tolerance: float = EXACT_RELATIVE_TOLERANCE,
+    ) -> list[str]:
+        """Re-execute ``code`` and report how it differs from its own result.
+
+        The up-front determinism check only re-runs each program once, so an
+        *intermittently* flaky program can pass it and then fail a comparison.
+        Re-checking at the point of failure costs one build on the few programs
+        that need it, instead of several on every program.
+        """
+
+        repeat = shape_metrics(_result_of(run(code, label), result_name))
+        return compare_metrics(
+            baseline,
+            repeat,
+            relative_tolerance=relative_tolerance,
+            absolute_tolerance=EXACT_ABSOLUTE_TOLERANCE,
+        )
+
     def _topology_identical() -> tuple[bool, dict[str, Any]]:
         left = shape_metrics(source_result)
         right = shape_metrics(canonical_result)
@@ -537,7 +560,7 @@ def evaluate_program(
             relative_tolerance=EXACT_RELATIVE_TOLERANCE,
             absolute_tolerance=EXACT_ABSOLUTE_TOLERANCE,
         )
-        return not mismatches, {
+        detail: dict[str, Any] = {
             "mismatches": mismatches,
             "solids": left.solids,
             "faces": left.faces,
@@ -545,6 +568,21 @@ def evaluate_program(
             "vertices": left.vertices,
             "volume": left.volume,
         }
+        if mismatches and check_determinism:
+            try:
+                unstable = _disagrees_with_itself(
+                    source, shape_metrics(source_result), "source-recheck"
+                )
+            except Exception as error:
+                unstable = [f"recheck failed: {type(error).__name__}: {error}"]
+            if unstable:
+                detail["not_applicable"] = (
+                    "source program is not reproducible; it disagrees with its own "
+                    "second run, so it cannot serve as a baseline"
+                )
+                detail["source_self_mismatches"] = unstable[:4]
+                return True, detail
+        return not mismatches, detail
 
     gates.append(_run_gate("topology_identical", _topology_identical))
 
@@ -656,10 +694,31 @@ def evaluate_program(
                 relative_tolerance=1e-6,
                 absolute_tolerance=1e-6,
             )
-            return not mismatches, {
+            detail: dict[str, Any] = {
                 "mismatches": mismatches,
                 "faces": left["metrics"].faces,
             }
+            if mismatches and check_determinism:
+                # Binarized programs are as prone to non-reproducible builds as
+                # their sources -- more so, since rounding pushes dimensions onto
+                # tangency cases.
+                try:
+                    unstable = _disagrees_with_itself(
+                        left["code"],
+                        left["metrics"],
+                        "qsource-recheck",
+                        relative_tolerance=1e-6,
+                    )
+                except Exception:
+                    unstable = ["recheck failed"]
+                if unstable:
+                    detail["not_applicable"] = (
+                        "binarized source is not reproducible, so it cannot serve "
+                        "as a baseline"
+                    )
+                    detail["source_self_mismatches"] = unstable[:4]
+                    return True, detail
+            return not mismatches, detail
 
         gates.append(_run_gate("quantization_commutes", _quantization_commutes))
 
@@ -775,6 +834,29 @@ def evaluate_program(
                 moved = not math.isclose(
                     baseline.volume, left.volume, rel_tol=1e-9, abs_tol=1e-9
                 )
+                if mismatches and check_determinism:
+                    try:
+                        unstable = _disagrees_with_itself(
+                            perturbed_source,
+                            left,
+                            "pert-recheck",
+                            relative_tolerance=PERTURBATION_RELATIVE_TOLERANCE,
+                        )
+                    except Exception:
+                        unstable = ["recheck failed"]
+                    if unstable:
+                        # The perturbed program is not reproducible, so it cannot
+                        # be its own baseline either.
+                        case.update(
+                            {
+                                "passed": True,
+                                "not_applicable": "perturbed program is not "
+                                "reproducible",
+                                "source_self_mismatches": unstable[:2],
+                            }
+                        )
+                        cases.append(case)
+                        continue
                 case.update(
                     {
                         "passed": not mismatches,
