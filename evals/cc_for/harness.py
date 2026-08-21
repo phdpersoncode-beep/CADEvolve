@@ -21,7 +21,10 @@ from __future__ import annotations
 
 import ast
 import math
+import signal
 import time
+from collections import Counter
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
@@ -51,6 +54,40 @@ QUANTIZED_MAX_CHAMFER = 0.05
 PERTURBATION_FACTOR = 1.37
 PERTURBATION_MIN_IOU = 0.999
 DEFAULT_MAX_PERTURBATIONS = 3
+
+# A CAD program can run forever: a corpus program with a data-dependent ``while``,
+# or one of ours once a perturbation pushes a convergence ratio past 1.0.  Every
+# execution therefore runs under a wall-clock alarm.
+DEFAULT_EXECUTION_TIMEOUT = 90.0
+
+
+class ProgramTimeout(RuntimeError):
+    """Raised when a program exceeds its execution budget."""
+
+
+@contextmanager
+def time_limit(seconds: float):
+    """Interrupt the running program after ``seconds`` of wall clock.
+
+    ``SIGALRM`` only fires between bytecodes, so a single OpenCascade call that
+    never returns cannot be interrupted -- but a Python loop calling into
+    OpenCascade repeatedly can, and that is the case that actually occurs.
+    """
+
+    if seconds <= 0:
+        yield
+        return
+
+    def _fire(signum, frame):  # noqa: ANN001 - signal handler signature
+        raise ProgramTimeout(f"program exceeded {seconds:g}s")
+
+    previous = signal.signal(signal.SIGALRM, _fire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 @dataclass
@@ -91,9 +128,14 @@ class ProgramEvaluation:
         return None
 
 
-def execute(code: str, filename: str = "<program>") -> dict[str, Any]:
+def execute(
+    code: str,
+    filename: str = "<program>",
+    timeout: float = DEFAULT_EXECUTION_TIMEOUT,
+) -> dict[str, Any]:
     namespace: dict[str, Any] = {"__name__": "__cad_program__"}
-    exec(compile(code, filename, "exec"), namespace, namespace)
+    with time_limit(timeout):
+        exec(compile(code, filename, "exec"), namespace, namespace)
     return namespace
 
 
@@ -162,12 +204,24 @@ def _perturbable_parameters(
 
     canonical_names = code_metrics.bound_names(canonical)
     canonical_loads = code_metrics.load_counts(canonical)
+    # Only single-definition names are comparable: a name the source rebinds is
+    # split into x_1/x_2 by SSA, so scaling "x" on one side and "x_1" on the other
+    # would perturb different things and the gate would compare unlike programs.
+    definitions = Counter(
+        target.id
+        for stmt in ast.parse(source).body
+        if isinstance(stmt, ast.Assign)
+        for target in stmt.targets
+        if isinstance(target, ast.Name)
+    )
     pairs: list[tuple[str, str]] = []
     for stmt in ast.parse(source).body:
         if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1):
             continue
         target, value = stmt.targets[0], stmt.value
         if not (isinstance(target, ast.Name) and isinstance(value, ast.Constant)):
+            continue
+        if definitions[target.id] != 1:
             continue
         if not isinstance(value.value, float) or value.value == 0.0:
             # Integers are usually counts; scaling them changes topology on
@@ -195,12 +249,17 @@ def evaluate_program(
     run_quantization: bool = True,
     run_perturbations: bool = True,
     max_perturbations: int = DEFAULT_MAX_PERTURBATIONS,
+    execution_timeout: float = DEFAULT_EXECUTION_TIMEOUT,
     voxel_resolution: int | None = None,
     surface_points: int | None = None,
     keep_canonical_code: bool = False,
 ) -> ProgramEvaluation:
     started = time.monotonic()
     gates: list[Gate] = []
+
+    def run(code: str, label: str) -> dict[str, Any]:
+        return execute(code, f"{name}:{label}", timeout=execution_timeout)
+
     similarity_kwargs: dict[str, Any] = {}
     if voxel_resolution is not None:
         similarity_kwargs["voxel_resolution"] = voxel_resolution
@@ -382,7 +441,7 @@ def evaluate_program(
 
     def _source_executes() -> tuple[bool, dict[str, Any]]:
         nonlocal source_result
-        source_result = _result_of(execute(source, f"{name}:source"), result_name)
+        source_result = _result_of(run(source, "source"), result_name)
         metrics = shape_metrics(source_result)
         return metrics.valid, {"metrics": metrics.to_dict()}
 
@@ -391,7 +450,7 @@ def evaluate_program(
 
     def _canonical_executes() -> tuple[bool, dict[str, Any]]:
         nonlocal canonical_result
-        canonical_result = _result_of(execute(canonical, f"{name}:canonical"), result_name)
+        canonical_result = _result_of(run(canonical, "canonical"), result_name)
         metrics = shape_metrics(canonical_result)
         return metrics.valid, {"metrics": metrics.to_dict()}
 
@@ -452,7 +511,7 @@ def evaluate_program(
             for index, action in enumerate(actions):
                 chunks.append(action.code)
                 try:
-                    execute("\n".join(chunks), f"{name}:prefix{index}")
+                    run("\n".join(chunks), f"prefix{index}")
                 except Exception as error:
                     return False, {
                         "actions": len(actions),
@@ -466,47 +525,98 @@ def evaluate_program(
         gates.append(_skipped("prefixes_execute", "disabled"))
 
     # --- downstream binarization -----------------------------------------
+    # Binarization is a separate legacy stage.  It can mangle or even break a
+    # program on its own, so damage is attributed: a gate fails only when the
+    # *canonical* program fares worse than the source under the same transform.
     if run_quantization:
         from utils.canonicalization.cc_for_validation import binarize_numeric_literals
 
-        quantized_canonical: str | None = None
+        binarized: dict[str, Any] = {}
+
+        def _binarize_both() -> None:
+            for label, code in (("source", source), ("canonical", canonical)):
+                entry: dict[str, Any] = {}
+                try:
+                    entry["code"] = binarize_numeric_literals(code)
+                except Exception as error:
+                    entry["error"] = f"transform: {type(error).__name__}: {error}"
+                    binarized[label] = entry
+                    continue
+                try:
+                    entry["result"] = _result_of(
+                        run(entry["code"], f"q{label}"), result_name
+                    )
+                    entry["metrics"] = shape_metrics(entry["result"])
+                except Exception as error:
+                    entry["error"] = f"build: {type(error).__name__}: {error}"
+                binarized[label] = entry
 
         def _quantization_commutes() -> tuple[bool, dict[str, Any]]:
-            nonlocal quantized_canonical
-            quantized_source = binarize_numeric_literals(source)
-            quantized_canonical = binarize_numeric_literals(canonical)
-            left = shape_metrics(
-                _result_of(execute(quantized_source, f"{name}:qsource"), result_name)
-            )
-            right = shape_metrics(
-                _result_of(execute(quantized_canonical, f"{name}:qcanonical"), result_name)
-            )
+            _binarize_both()
+            left, right = binarized["source"], binarized["canonical"]
+            left_ok = "metrics" in left
+            right_ok = "metrics" in right
+            if not left_ok and not right_ok:
+                # The legacy binarizer cannot handle this program at all.  That is
+                # a property of the binarizer, not of canonicalization.
+                return True, {
+                    "not_applicable": "binarized source does not build either",
+                    "source_error": left.get("error"),
+                    "canonical_error": right.get("error"),
+                }
+            if left_ok != right_ok:
+                return False, {
+                    "source_builds": left_ok,
+                    "canonical_builds": right_ok,
+                    "source_error": left.get("error"),
+                    "canonical_error": right.get("error"),
+                }
             mismatches = compare_metrics(
-                left,
-                right,
+                left["metrics"],
+                right["metrics"],
                 relative_tolerance=1e-6,
                 absolute_tolerance=1e-6,
             )
-            return not mismatches, {"mismatches": mismatches, "faces": left.faces}
+            return not mismatches, {
+                "mismatches": mismatches,
+                "faces": left["metrics"].faces,
+            }
 
         gates.append(_run_gate("quantization_commutes", _quantization_commutes))
 
         def _quantized_shape_close() -> tuple[bool, dict[str, Any]]:
-            if quantized_canonical is None:
-                raise ValueError("binarized canonical program unavailable")
-            quantized_result = _result_of(
-                execute(quantized_canonical, f"{name}:qcanonical"), result_name
+            if not binarized:
+                _binarize_both()
+            canonical_entry = binarized.get("canonical", {})
+            source_entry = binarized.get("source", {})
+            if "metrics" not in canonical_entry:
+                return True, {
+                    "not_applicable": "binarized program does not build",
+                    "error": canonical_entry.get("error"),
+                }
+            scores = compare_shapes(
+                source_result, canonical_entry["result"], **similarity_kwargs
             )
-            scores = compare_shapes(source_result, quantized_result, **similarity_kwargs)
-            ok = (
-                scores.voxel_iou >= QUANTIZED_MIN_IOU
-                and scores.chamfer_l2 <= QUANTIZED_MAX_CHAMFER
-            )
-            return ok, {
+            detail: dict[str, Any] = {
                 "scores": scores.to_dict(),
                 "min_iou": QUANTIZED_MIN_IOU,
                 "max_chamfer": QUANTIZED_MAX_CHAMFER,
             }
+            # How much of the divergence is the binarizer's own doing?
+            if "metrics" in source_entry:
+                baseline = compare_shapes(
+                    source_result, source_entry["result"], **similarity_kwargs
+                )
+                detail["binarizer_baseline"] = baseline.to_dict()
+                detail["iou_lost_to_canonicalization"] = (
+                    baseline.voxel_iou - scores.voxel_iou
+                )
+                # CC-for is only at fault for the gap against that baseline.
+                return scores.voxel_iou >= baseline.voxel_iou - 1e-6, detail
+            return (
+                scores.voxel_iou >= QUANTIZED_MIN_IOU
+                and scores.chamfer_l2 <= QUANTIZED_MAX_CHAMFER
+            ), detail
 
         gates.append(_run_gate("quantized_shape_close", _quantized_shape_close))
     else:
@@ -533,10 +643,10 @@ def evaluate_program(
                 case: dict[str, Any] = {"parameter": source_name}
                 try:
                     left_result = _result_of(
-                        execute(perturbed_source, f"{name}:pert-source"), result_name
+                        run(perturbed_source, "pert-source"), result_name
                     )
                     right_result = _result_of(
-                        execute(perturbed_canonical, f"{name}:pert-canonical"), result_name
+                        run(perturbed_canonical, "pert-canonical"), result_name
                     )
                 except Exception as error:
                     # Some parameters are not freely scalable (a boss larger than
@@ -544,12 +654,12 @@ def evaluate_program(
                     # canonicalization defect, so only a one-sided failure counts.
                     left_ok = right_ok = False
                     try:
-                        execute(perturbed_source, f"{name}:pert-source")
+                        run(perturbed_source, "pert-source")
                         left_ok = True
                     except Exception:
                         pass
                     try:
-                        execute(perturbed_canonical, f"{name}:pert-canonical")
+                        run(perturbed_canonical, "pert-canonical")
                         right_ok = True
                     except Exception:
                         pass

@@ -206,13 +206,59 @@ class PreambleLayout:
         return asdict(self)
 
 
-def preamble_layout(code: str, result_name: str = "result") -> PreambleLayout:
-    """Check that named parameters form one contiguous block after the imports."""
+def control_flow_bound_names(code: str) -> set[str]:
+    """Names assigned anywhere inside a loop, branch, or ``try`` block.
+
+    Such a name cannot be hoisted into the preamble without changing semantics, so
+    it is not evidence of a badly placed parameter block.
+    """
+
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(code)):
+        if not isinstance(node, (ast.For, ast.AsyncFor, ast.While, ast.If, ast.Try)):
+            continue
+        for child in ast.walk(node):
+            targets: list[ast.AST] = []
+            if isinstance(child, ast.Assign):
+                targets = list(child.targets)
+            elif isinstance(child, (ast.AnnAssign, ast.AugAssign, ast.For, ast.AsyncFor)):
+                targets = [child.target]
+            for target in targets:
+                for leaf in ast.walk(target):
+                    if isinstance(leaf, ast.Name) and isinstance(leaf.ctx, ast.Store):
+                        names.add(leaf.id)
+    return names
+
+
+def preamble_layout(
+    code: str,
+    result_name: str = "result",
+    exempt: frozenset[str] | set[str] = frozenset(),
+) -> PreambleLayout:
+    """Check that named parameters form one contiguous block after the imports.
+
+    ``exempt`` holds names the contract deliberately leaves in place -- loop-carried
+    state and anything rebound inside control flow.
+    """
 
     tree = ast.parse(code)
     body = tree.body
+    exempt = set(exempt) | control_flow_bound_names(code)
+
+    def is_header(stmt: ast.stmt) -> bool:
+        """Imports and the module docstring precede the parameter block."""
+
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            return True
+        return (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        )
 
     def is_geometry_statement(stmt: ast.stmt) -> bool:
+        if is_header(stmt):
+            return False
         if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
             target = stmt.targets[0]
             if isinstance(target, ast.Name) and (
@@ -220,13 +266,11 @@ def preamble_layout(code: str, result_name: str = "result") -> PreambleLayout:
             ):
                 return True
             return not _is_pure_data(stmt.value)
-        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-            return False
         return True  # loops, defs, classes, expressions: modelling territory
 
     imports = 0
     for stmt in body:
-        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        if is_header(stmt):
             imports += 1
         else:
             break
@@ -237,6 +281,14 @@ def preamble_layout(code: str, result_name: str = "result") -> PreambleLayout:
             first_geometry = index
             break
 
+    # A pure-data assignment whose value reads a lowered geometry step is a
+    # geometry alias, not a parameter.
+    def aliases_geometry(node: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Name) and _WORKPLANE_NAME.match(child.id)
+            for child in ast.walk(node)
+        )
+
     late: list[str] = []
     for stmt in body[first_geometry:]:
         if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
@@ -245,7 +297,9 @@ def preamble_layout(code: str, result_name: str = "result") -> PreambleLayout:
                 isinstance(target, ast.Name)
                 and not _WORKPLANE_NAME.match(target.id)
                 and target.id != result_name
+                and target.id not in exempt
                 and not target.id.startswith(_GENERATED_PREFIXES)
+                and not aliases_geometry(stmt.value)
                 and _is_pure_data(stmt.value)
             ):
                 late.append(target.id)
@@ -406,5 +460,9 @@ def compare_code(
         numeric_literals_removed=_multiset_difference(source_numbers, canonical_numbers),
         string_literals_added=_multiset_difference(canonical_strings, source_strings),
         string_literals_removed=_multiset_difference(source_strings, canonical_strings),
-        preamble=preamble_layout(canonical, result_name).to_dict(),
+        preamble=preamble_layout(
+            canonical,
+            result_name,
+            exempt=frozenset(report.get("loop_carried_names", ()) or ()),
+        ).to_dict(),
     )

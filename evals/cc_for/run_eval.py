@@ -33,7 +33,11 @@ import tarfile
 import tempfile
 import time
 import warnings
-from concurrent.futures import ProcessPoolExecutor, TimeoutError as FutureTimeout
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    TimeoutError as FutureTimeout,
+    as_completed,
+)
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -107,6 +111,28 @@ def collect_sources(corpus: str, limit: int | None, offset: int, workdir: Path) 
     return paths
 
 
+def _failure_record(name: str, error: str) -> dict[str, Any]:
+    """A record for a program that never produced gate results."""
+
+    return {
+        "name": name,
+        "passed": False,
+        "failed_gates": ["converts"],
+        "gates": [
+            {
+                "name": "converts",
+                "passed": False,
+                "skipped": False,
+                "detail": {},
+                "error": error,
+                "seconds": 0.0,
+            }
+        ],
+        "report": {},
+        "code_comparison": {},
+    }
+
+
 _WORKER_OPTIONS: dict[str, Any] = {}
 
 
@@ -140,13 +166,13 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
             else:
                 bucket["failed"] += 1
 
-    def _scores(gate_name: str, key: str) -> list[float]:
+    def _scores(gate_name: str, key: str, key_path: str = "scores") -> list[float]:
         values: list[float] = []
         for record in records:
             for gate in record.get("gates", []):
                 if gate["name"] != gate_name or gate.get("skipped"):
                     continue
-                scores = gate.get("detail", {}).get("scores")
+                scores = gate.get("detail", {}).get(key_path)
                 if scores and scores.get(key) is not None:
                     values.append(float(scores[key]))
         return values
@@ -183,6 +209,9 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
         "quantized_chamfer_l2": _distribution(
             _scores("quantized_shape_close", "chamfer_l2")
         ),
+        "binarizer_baseline_iou": _distribution(
+            _scores("quantized_shape_close", "voxel_iou", key_path="binarizer_baseline")
+        ),
         "total_loops_preserved": sum(
             record.get("report", {}).get("preserved_loops", 0) for record in records
         ),
@@ -208,6 +237,7 @@ def format_summary(summary: dict[str, Any]) -> str:
         "exact_chamfer_l2",
         "quantized_voxel_iou",
         "quantized_chamfer_l2",
+        "binarizer_baseline_iou",
     ):
         distribution = summary.get(label)
         if distribution:
@@ -235,6 +265,20 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     parser.add_argument("--timeout", type=float, default=300.0, help="seconds per program")
+    parser.add_argument(
+        "--execution-timeout",
+        type=float,
+        default=90.0,
+        help="wall-clock budget for one program execution; a CAD program can loop "
+        "forever, and a perturbed one more easily still",
+    )
+    parser.add_argument(
+        "--tasks-per-child",
+        type=int,
+        default=8,
+        help="programs per worker before the pool is recreated; OpenCascade "
+        "holds memory across programs, so long runs need periodic recycling",
+    )
     parser.add_argument("--loop-mode", choices=("preserve", "unroll"), default="preserve")
     parser.add_argument("--no-geometry", action="store_true", help="AST gates only")
     parser.add_argument("--no-prefixes", action="store_true")
@@ -263,6 +307,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "run_perturbations": not args.no_perturbations,
         "voxel_resolution": args.voxel_resolution,
         "surface_points": args.surface_points,
+        "execution_timeout": args.execution_timeout,
     }
 
     with tempfile.TemporaryDirectory(prefix="cc-for-eval-") as scratch:
@@ -272,59 +317,59 @@ def main(argv: Iterable[str] | None = None) -> int:
 
         started = time.monotonic()
         records: list[dict[str, Any]] = []
-        with ProcessPoolExecutor(
-            max_workers=args.workers, initializer=_init_worker, initargs=(options,)
-        ) as pool:
-            futures = {
-                pool.submit(_evaluate_path, str(path)): path for path in sources
-            }
-            for index, future in enumerate(list(futures), start=1):
-                path = futures[future]
+        # Workers are recycled by running the corpus in batches with a fresh pool
+        # each time, rather than via max_tasks_per_child: that option forces the
+        # spawn start method, which deadlocks on worker replacement here.
+        # OpenCascade holds memory across programs, so unbounded workers grow
+        # until the machine runs out.
+        batch_size = max(1, args.workers * max(1, args.tasks_per_child))
+        completed = 0
+        for batch_start in range(0, len(sources), batch_size):
+            batch = sources[batch_start : batch_start + batch_size]
+            budget = args.timeout * (len(batch) / max(1, args.workers) + 1.0)
+            with ProcessPoolExecutor(
+                max_workers=args.workers, initializer=_init_worker, initargs=(options,)
+            ) as pool:
+                futures = {pool.submit(_evaluate_path, str(path)): path for path in batch}
                 try:
-                    record = future.result(timeout=args.timeout)
+                    for future in as_completed(futures, timeout=budget):
+                        path = futures[future]
+                        try:
+                            record = future.result()
+                        except Exception as error:
+                            record = _failure_record(
+                                path.name, f"{type(error).__name__}: {error}"
+                            )
+                        records.append(record)
+                        completed += 1
+                        if not args.quiet:
+                            failed = record.get("failed_gates") or []
+                            status = "ok  " if record.get("passed") else "FAIL"
+                            note = f"  [{', '.join(failed)}]" if failed else ""
+                            print(
+                                f"[{completed}/{len(sources)}] {status} "
+                                f"{record['name']}{note}",
+                                flush=True,
+                            )
                 except FutureTimeout:
-                    record = {
-                        "name": path.name,
-                        "passed": False,
-                        "gates": [
-                            {
-                                "name": "converts",
-                                "passed": False,
-                                "skipped": False,
-                                "detail": {},
-                                "error": f"timeout after {args.timeout}s",
-                                "seconds": args.timeout,
-                            }
-                        ],
-                        "report": {},
-                        "code_comparison": {},
-                    }
-                except Exception as error:
-                    record = {
-                        "name": path.name,
-                        "passed": False,
-                        "gates": [
-                            {
-                                "name": "converts",
-                                "passed": False,
-                                "skipped": False,
-                                "detail": {},
-                                "error": f"{type(error).__name__}: {error}",
-                                "seconds": 0.0,
-                            }
-                        ],
-                        "report": {},
-                        "code_comparison": {},
-                    }
-                records.append(record)
-                if not args.quiet:
-                    failed = record.get("failed_gates") or []
-                    status = "ok  " if record.get("passed") else "FAIL"
-                    note = f"  [{', '.join(failed)}]" if failed else ""
-                    print(
-                        f"[{index}/{len(sources)}] {status} {record['name']}{note}",
-                        flush=True,
-                    )
+                    for future, path in futures.items():
+                        if future.done():
+                            continue
+                        future.cancel()
+                        records.append(
+                            _failure_record(
+                                path.name, f"batch budget of {budget:.0f}s exhausted"
+                            )
+                        )
+                        completed += 1
+                        if not args.quiet:
+                            print(
+                                f"[{completed}/{len(sources)}] FAIL {path.name}  "
+                                "[timeout]",
+                                flush=True,
+                            )
+                    for process in list(pool._processes.values()):
+                        process.kill()
 
     records.sort(key=lambda record: record["name"])
     summary = summarize(records)
