@@ -45,6 +45,14 @@ KNOWN_FAILURES: dict[str, dict[str, str]] = {
         "structure": "fluent chains inside try/except bodies are not lowered",
         "chains_lowered": "fluent chains inside try/except bodies are not lowered",
     },
+    "self_attribute_rebuild": {
+        "canonical_executes": "self.wp is copy-propagated back to the constructor "
+        "argument across self.build(), so the canonical program builds nothing",
+    },
+    "result_read_before_alias": {
+        "canonical_executes": "a bare statement reading a loop-carried `result` is "
+        "not rewritten to the renamed state variable",
+    },
 }
 
 # The workplane counter continues past any existing wpN, so re-running the
@@ -113,6 +121,36 @@ def test_canonicalization_is_idempotent() -> None:
     once = canonicalize_code(source).code
     twice = canonicalize_code(once).code
     assert twice == once
+
+
+def test_self_attribute_copy_propagation_is_still_open() -> None:
+    """Silent geometry loss: the canonical program builds an empty part.
+
+    Nothing raises and no structural error is reported, so only comparing the
+    solids finds it.  Inverted the day the propagation is made sound.
+    """
+
+    source = (
+        "import cadquery as cq\n"
+        "class Part:\n"
+        "    def __init__(self, workplane, size):\n"
+        "        self.wp = workplane\n"
+        "        self.size = size\n"
+        "        self.build()\n"
+        "        self.model = self.wp\n"
+        "    def build(self):\n"
+        "        self.wp = self.wp.box(self.size, self.size, self.size)\n"
+        "result = Part(cq.Workplane('XY'), 10.0).model\n"
+    )
+    canonical = canonicalize_code(source)
+    assert canonical.report.structural_errors == []
+    assert "self.model = workplane" in canonical.code
+
+    if not HAS_CADQUERY:
+        return
+    namespace: dict = {}
+    exec(compile(canonical.code, "<canonical>", "exec"), namespace, namespace)
+    assert namespace["result"].vals() == [], "geometry loss appears to be fixed"
 
 
 def test_augmented_assignment_regression_is_still_open() -> None:

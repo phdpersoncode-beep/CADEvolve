@@ -1,0 +1,244 @@
+# CC-for evaluation results
+
+Independent evaluation of the CC-for canonicalization pipeline
+(PR [#1](https://github.com/phdpersoncode-beep/CADEvolve/pull/1),
+branch `agent/cc-for-canonicalization`) using the suite in
+[`evals/cc_for/`](../evals/cc_for/README.md).
+
+Corpus: the 5,000 checked-in Zero-to-CAD programs in
+`demo_data/zero_to_cad_5k/`, plus 22 hand-written edge cases in
+`evals/cc_for/cases/`. Environment: CadQuery 2.5.2 / OCP 7.7.2, Python 3.11.
+
+## Headline
+
+The canonicalizer does what the PR claims, on essentially the whole corpus:
+named parameters survive, loops stay intact, and the canonical program builds
+the *same solid* as the source. Five defects sit underneath that result, three
+of which produce a wrong program at runtime while passing every check the PR
+currently runs.
+
+## What holds
+
+Full corpus, 5,000 programs, AST gates:
+
+| Gate | Result |
+|---|---|
+| `converts` | 5000 / 5000 |
+| `structure` (one terminal `result`, no unlowered modelling chains) | 5000 / 5000 |
+| `loops_preserved` (same `for` count in preserve mode) | 5000 / 5000 |
+| `literals_stable` (no numeric or string literal invented or dropped) | 5000 / 5000 |
+| `parameters_preserved` | 4990 / 5000 |
+| `parameters_hoisted` (contiguous preamble) | 4991 / 5000 |
+| `chains_lowered` | 4995 / 5000 |
+
+Parameter retention: mean **0.9999**, median 1.0, min 0.833.
+Preamble coverage (share of a program's numeric design parameters bound by name
+in the canonical preamble, n=4,711 programs that have any): mean **0.9951**,
+median 1.0. 2,082 loops preserved, 110,696 explicit workplane steps emitted.
+
+Geometry, 250-program sample with every gate (see the run summary at the end of
+this document for the final numbers) plus all 22 edge cases:
+
+- **Exact solid equivalence.** Source and canonical agree on solid, shell, face,
+  wire, edge and vertex counts, on face and edge *type* histograms, and on
+  volume, area, bounding box and centre of mass. Voxel IoU is 1.0 and the
+  surface Chamfer sits below the sampling noise floor.
+- **Action prefixes execute.** Every emitted `wpN` prefix runs standalone.
+- **Binarization commutes.** Binarizing the source and binarizing the canonical
+  program give the same solid wherever the binarizer can build either.
+- **Parameter perturbation is consistent.** Scaling a named parameter by 1.37 in
+  the source and in the canonical program produces the same solid — the check
+  that the symbolic relationships are genuinely intact rather than frozen.
+
+## Defects
+
+### 1. `AugAssign` breaks the canonical program — `NameError`
+
+The SSA renamer versions a name's plain-assignment definition but leaves every
+`AugAssign` occurrence on the original name. The canonical program then
+references a name that was never bound.
+
+```python
+# source
+total = 1.0
+total += 2.0
+result = cq.Workplane('XY').box(total, 2, 2)
+
+# canonical  ->  NameError: name 'total' is not defined
+total_1 = 1.0
+total += 2.0
+result = ... .box(total_1, 2, 2)
+```
+
+Two things are wrong: the `AugAssign` target is unversioned, and the consumer
+reads `total_1` (the pre-increment value) rather than the accumulated one, so
+fixing only the `NameError` would still change the geometry.
+
+Corpus impact: 46/5,000 programs use `AugAssign` on a plain name; **4 of them
+produce a canonical program that raises `NameError`** while passing the
+structural scan. `evals/cc_for/cases/augmented_assignment_offsets.py` covers it.
+
+### 2. A statement reading a loop-carried `result` is not rewritten
+
+When `result` is rebound inside control flow it becomes `result_state`, but a
+bare statement that reads `result` before the terminal alias is left untouched.
+
+```python
+# source
+result = cq.Workplane('XY').box(size, size, size)
+for selector in ('>X', '<X'):
+    result = result.faces(selector).workplane().hole(4.0)
+assert result.solids().size() == 1
+result = result.edges('|Z').fillet(1.0)
+
+# canonical  ->  NameError: name 'result' is not defined
+result_state = wp2
+for selector in ('>X', '<X'):
+    ...
+    result_state = wp5
+assert result.solids().size() == 1     # <- not rewritten
+...
+result = wp8                            # <- bound only here
+```
+
+Corpus impact: 2/5,000. Small, but `assert result.solids().size() == 1` is a
+common self-check idiom in generated CAD programs, so the rate depends on the
+generator rather than on anything intrinsic.
+
+### 3. Silent geometry loss from copy-propagating a `self` attribute
+
+The worst of the five, because nothing fails. An attribute alias is replaced by
+the constructor argument it was initialised from, ignoring that an intervening
+method call reassigns it:
+
+```python
+class Part:
+    def __init__(self, workplane, size):
+        self.wp = workplane
+        self.size = size
+        self.build()             # reassigns self.wp
+        self.model = self.wp     # canonical rewrites this to `workplane`
+
+    def build(self):
+        self.wp = self.wp.box(self.size, self.size, self.size)
+
+result = Part(cq.Workplane('XY'), 10.0).model
+```
+
+The canonical program runs cleanly, reports no structural error, and produces an
+**empty** `Workplane` where the source produces a 1000 mm³ box.
+
+Corpus impact: 6/5,000 programs match the store → call → read-back pattern, and
+**all 6 lose all their geometry**. This is the case a structural scan can never
+find, and an execute-only check ("does it run?") cannot find either — it needs
+the solids compared.
+
+### 4. Canonicalization is not idempotent
+
+`canonicalize(canonicalize(x)) != canonicalize(x)` for **every one of the 5,000
+programs**. The `wpN` counter skips any name already bound in the input, so
+re-running the converter on its own output renumbers every step:
+
+```
+wp1 … wp24   ->   wp25 … wp48
+```
+
+The collision-avoidance is right in principle — a source program may have its
+own `wp3` — but it does not distinguish a user's `wp3` from a `wp3` the
+converter itself is about to replace. Consequences: canonical form is not a
+fixed point, so content-hash dedup and resumed or re-run conversions are not
+reproducible, and a re-processed shard trains on a different token distribution
+than a first-pass shard.
+
+### 5. Coverage gaps
+
+Neither of these corrupts a program; both leave the representation short of the
+contract's intent.
+
+- **Chains inside `try`/`except` are not lowered.** The lowering pass handles
+  `If`, `For` and `While` bodies but not `Try`, so a guarded modelling step stays
+  a nested fluent chain. The converter self-reports the violation
+  (`found 2 unlowered fluent CadQuery call(s)`), so with `keep_failed: false`
+  the program is dropped rather than silently mis-converted — a coverage gap,
+  not a correctness bug. `evals/cc_for/cases/try_except_fallback.py` covers it.
+- **User-class parameter containers are not flattened.** 182/5,000 programs
+  (3.64%) define their own `Measures`-style class instead of using
+  `SimpleNamespace`. Their design parameters stay as literals inside the
+  constructor call and never reach the preamble: of the 90 such programs that
+  have numeric design parameters, mean preamble coverage is **0.78**, and the
+  23 programs corpus-wide with *zero* coverage are almost entirely this idiom.
+  A dimension buried in a constructor call is not editable by a downstream model
+  even though the program builds correctly.
+- **Nested builder-method chains stay nested.** 5/5,000 keep chains such as
+  `self.build_base().cut_holes().add_ribs().apply_fillet()`, because the
+  converter cannot tell that a user method returns geometry. Each is a modelling
+  step that the action decomposition does not see.
+
+## Why the existing validation did not catch these
+
+The PR reports 5,000/5,000 passing and 32/32 on the geometry gates. Both numbers
+are reproducible — but the 5,000 is a **structure-only** scan. `validate_structure`
+parses, compiles, and checks for one terminal `result` and no unlowered chains.
+Defects 1, 2 and 3 all satisfy every one of those conditions: they are runtime
+failures or silent geometry loss.
+
+The geometry gate that would catch them ran on 32 programs. At the measured rates
+(4, 2 and 6 programs in 5,000), the chance that a 32-program sample contains any
+of them is roughly 7%.
+
+Two further observations about the existing gates:
+
+- **The quantized-geometry threshold cannot fail.** `validate_quantized_geometry`
+  accepts a normalized squared Chamfer up to `0.15`. On
+  `evals/cc_for/cases/derived_parameter_chain.py` the legacy binarizer rounds
+  `pad_length = lever * 0.45` to `lever * 0`, producing a solid with **negative
+  volume (-2601)**, 3 bodies instead of 2, a Z extent of 92 against 26, and a
+  voxel IoU against the source of **0.0094**. Its squared Chamfer is 0.067, so
+  the gate passes it. A threshold that accepts a 0.9% IoU is not a geometry gate.
+  (This is the legacy binarizer's damage, not CC-for's — see below — but the gate
+  is what is supposed to detect it.)
+- **A binarizer failure is reported as a canonicalization failure.** When the
+  legacy binarizer cannot build the *source* either, the gate still reports
+  `"source and CC-for diverged after binarization"`. They did not diverge; both
+  failed identically. Three of the 22 edge cases hit this.
+
+## Binarizer damage is not canonicalization damage
+
+The suite measures the two separately. Comparing each program's post-binarization
+IoU against the source's own post-binarization IoU
+(`binarizer_baseline`), the two distributions are **identical to six decimal
+places** across the edge cases and the corpus sample. CC-for adds no measurable
+geometric damage under the downstream binarization stage; all of the divergence
+belongs to the legacy binarizer, which is severe on parts with sub-unit or
+non-integer derived factors (`* 0.45` → `* 0`).
+
+This supports the PR's own position that centering, scaling and binarization
+should stay separate, explicitly validated stages rather than being folded into
+canonicalization.
+
+## Suggested priorities
+
+1. **Defect 3** (silent geometry loss) — wrong data with no signal at all.
+2. **Defect 1** (`AugAssign`) — smallest fix, clearest reproduction, and it
+   affects the loop-accumulator programs the PR is specifically about.
+3. **Defect 4** (idempotence) — one-line intent change (do not reserve `wpN`
+   names the lowering pass is itself replacing), but it affects every output.
+4. **Defect 2** (`result` read before the alias).
+5. **Coverage gaps** — `try`/`except` lowering, then user-class containers.
+
+Independently of the fixes: promote the geometry gate from a 32-program sample
+to a corpus-scale run, since all three correctness defects are invisible to the
+structural scan that does run at 5,000.
+
+## Reproducing
+
+```bash
+pip install -r requirements-cc-for.txt
+
+PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval --corpus cases
+PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval \
+    --corpus demo --no-geometry --workers 4
+PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval \
+    --corpus demo --limit 250 --workers 3
+PYTHONPATH=.:dataset_utils python -m pytest tests/test_cc_for_eval_suite.py -q
+```
