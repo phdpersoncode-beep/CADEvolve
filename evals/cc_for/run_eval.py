@@ -196,6 +196,12 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
         for record in records
         if record.get("code_comparison")
     ]
+    coverage = [
+        record["code_comparison"]["preamble_coverage"]
+        for record in records
+        if record.get("code_comparison")
+        and record["code_comparison"].get("design_parameters")
+    ]
 
     return {
         "programs": len(records),
@@ -203,6 +209,7 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
         "failed": sum(1 for record in records if not record.get("passed")),
         "gates": {name: gates[name] for name in GATE_ORDER if name in gates},
         "parameter_retention": _distribution(retention),
+        "preamble_coverage": _distribution(coverage),
         "exact_voxel_iou": _distribution(_scores("shape_identical", "voxel_iou")),
         "exact_chamfer_l2": _distribution(_scores("shape_identical", "chamfer_l2")),
         "quantized_voxel_iou": _distribution(_scores("quantized_shape_close", "voxel_iou")),
@@ -233,6 +240,7 @@ def format_summary(summary: dict[str, Any]) -> str:
         )
     for label in (
         "parameter_retention",
+        "preamble_coverage",
         "exact_voxel_iou",
         "exact_chamfer_l2",
         "quantized_voxel_iou",
@@ -284,6 +292,12 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-prefixes", action="store_true")
     parser.add_argument("--no-quantization", action="store_true")
     parser.add_argument("--no-perturbations", action="store_true")
+    parser.add_argument(
+        "--max-prefix-checks",
+        type=int,
+        default=24,
+        help="prefixes to replay per program (0 = every one); replay is O(n^2)",
+    )
     parser.add_argument("--voxel-resolution", type=int, default=None)
     parser.add_argument("--surface-points", type=int, default=None)
     parser.add_argument("--report", type=Path, default=None, help="write a JSON report")
@@ -308,6 +322,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "voxel_resolution": args.voxel_resolution,
         "surface_points": args.surface_points,
         "execution_timeout": args.execution_timeout,
+        "max_prefix_checks": args.max_prefix_checks,
     }
 
     with tempfile.TemporaryDirectory(prefix="cc-for-eval-") as scratch:

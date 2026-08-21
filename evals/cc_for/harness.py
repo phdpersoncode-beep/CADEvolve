@@ -60,6 +60,11 @@ DEFAULT_MAX_PERTURBATIONS = 3
 # execution therefore runs under a wall-clock alarm.
 DEFAULT_EXECUTION_TIMEOUT = 90.0
 
+# Replaying every action prefix costs O(n^2) CAD operations.  Long programs are
+# subsampled -- always including the first and last prefix -- so a corpus run
+# stays affordable without dropping the gate.
+DEFAULT_MAX_PREFIX_CHECKS = 24
+
 
 class ProgramTimeout(RuntimeError):
     """Raised when a program exceeds its execution budget."""
@@ -250,6 +255,7 @@ def evaluate_program(
     run_perturbations: bool = True,
     max_perturbations: int = DEFAULT_MAX_PERTURBATIONS,
     execution_timeout: float = DEFAULT_EXECUTION_TIMEOUT,
+    max_prefix_checks: int = DEFAULT_MAX_PREFIX_CHECKS,
     voxel_resolution: int | None = None,
     surface_points: int | None = None,
     keep_canonical_code: bool = False,
@@ -507,18 +513,32 @@ def evaluate_program(
 
         def _prefixes_execute() -> tuple[bool, dict[str, Any]]:
             actions = decompose_actions(canonical, result_name=result_name)
+            if max_prefix_checks > 0 and len(actions) > max_prefix_checks:
+                step = len(actions) / max_prefix_checks
+                selected = sorted(
+                    {int(index * step) for index in range(max_prefix_checks)}
+                    | {len(actions) - 1}
+                )
+            else:
+                selected = list(range(len(actions)))
+
             chunks: list[str] = []
+            checked = 0
             for index, action in enumerate(actions):
                 chunks.append(action.code)
+                if index not in selected:
+                    continue
                 try:
                     run("\n".join(chunks), f"prefix{index}")
+                    checked += 1
                 except Exception as error:
                     return False, {
                         "actions": len(actions),
+                        "checked": checked,
                         "failed_index": index,
                         "error": f"{type(error).__name__}: {error}",
                     }
-            return True, {"actions": len(actions)}
+            return True, {"actions": len(actions), "checked": checked}
 
         gates.append(_run_gate("prefixes_execute", _prefixes_execute))
     else:
