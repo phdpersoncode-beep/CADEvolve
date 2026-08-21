@@ -80,6 +80,17 @@ Install only the converter and validation dependencies with:
 pip install -r requirements-cc-for.txt
 ```
 
+An independent evaluation suite for that converter lives in
+[`evals/cc_for/`](evals/cc_for/README.md). It compares the original program, the
+canonicalized program, and the solids both execute to — topology, mass
+properties, voxel IoU and surface Chamfer — alongside AST gates for parameter
+retention, preamble placement and loop preservation. Measured results are in
+[`docs/cc_for_eval_suite.md`](docs/cc_for_eval_suite.md).
+
+```bash
+PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval --corpus cases
+```
+
 ### 3) Train / infer / evaluate (Image2CAD VLM)
 
 All training utilities live in `train/`.

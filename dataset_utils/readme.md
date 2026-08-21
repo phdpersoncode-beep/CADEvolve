@@ -112,3 +112,17 @@ The following folders are created after running the pipeline (not included in th
   - `results/rotated/` — rotated scripts (main usable output).
   - `results/rotated_stl/` — STL exports for rotated scripts (main usable output).
   - `results/logs/` — pipeline logs.
+
+## CC-for evaluation suite
+
+`evals/cc_for/` holds an independent evaluation of this converter: it executes
+the original and canonical programs and compares the resulting solids
+(topology, mass properties, voxel IoU, surface Chamfer) as well as the code
+itself (parameter retention, preamble placement, loop preservation, literal
+drift). See [`evals/cc_for/README.md`](../evals/cc_for/README.md) for the gates
+and [`docs/cc_for_eval_suite.md`](../docs/cc_for_eval_suite.md) for results.
+
+```bash
+PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval --corpus cases
+PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval --corpus demo --no-geometry
+```

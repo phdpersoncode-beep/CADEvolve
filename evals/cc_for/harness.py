@@ -46,7 +46,12 @@ from .similarity import compare_shapes, sampling_noise_floor
 # were measured drifting by ~5e-8 relative on filleted and swept parts.
 EXACT_RELATIVE_TOLERANCE = 1e-7
 EXACT_ABSOLUTE_TOLERANCE = 1e-9
-EXACT_MIN_IOU = 0.999
+# Voxel IoU has a discretization floor of its own: a planar face that lands on a
+# voxel boundary flips a partial slab either way, so two identical solids can
+# score ~0.998 and the shortfall does not shrink with resolution (measured across
+# 32-80 on parts whose exact metrics match with zero mismatches).  A real
+# divergence -- a missing hole, a dropped body -- moves IoU far more than 1%.
+EXACT_MIN_IOU = 0.99
 # Surface Chamfer cannot be held to 1e-9: two builds of the same solid can
 # tessellate in a different vertex order, so the sampler draws different points.
 # The gate calibrates against that measured noise floor and keeps this only as a
@@ -58,6 +63,8 @@ EXACT_CHAMFER_NOISE_MULTIPLE = 3.0
 # numeric literal to an integer, so a small part changes shape noticeably.
 QUANTIZED_MIN_IOU = 0.80
 QUANTIZED_MAX_CHAMFER = 0.05
+# Slack for the same discretization floor when attributing IoU loss.
+VOXEL_IOU_SLACK = 1.0 - EXACT_MIN_IOU
 
 PERTURBATION_FACTOR = 1.37
 PERTURBATION_MIN_IOU = 0.999
@@ -647,8 +654,9 @@ def evaluate_program(
                 detail["iou_lost_to_canonicalization"] = (
                     baseline.voxel_iou - scores.voxel_iou
                 )
-                # CC-for is only at fault for the gap against that baseline.
-                return scores.voxel_iou >= baseline.voxel_iou - 1e-6, detail
+                # CC-for is only at fault for the gap against that baseline, and
+                # only beyond the voxel discretization floor described above.
+                return scores.voxel_iou >= baseline.voxel_iou - VOXEL_IOU_SLACK, detail
             return (
                 scores.voxel_iou >= QUANTIZED_MIN_IOU
                 and scores.chamfer_l2 <= QUANTIZED_MAX_CHAMFER
