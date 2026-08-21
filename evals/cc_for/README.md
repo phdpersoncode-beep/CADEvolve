@@ -78,6 +78,10 @@ PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval \
 # the repo's own fixtures, or any directory of programs
 PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval --corpus fixtures
 PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval --corpus path/to/dir
+
+# baseline a known open defect so the verdict reflects everything else
+PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval \
+    --corpus demo --no-geometry --ignore-gate idempotent --fail-under 0.99
 ```
 
 As pytest assertions:
@@ -94,6 +98,7 @@ PYTHONPATH=.:dataset_utils python -m pytest tests/test_cc_for_eval_suite.py -q
 | `--max-prefix-checks` | Prefix replay is O(n²) CAD calls; long programs are subsampled, first and last always included. |
 | `--tasks-per-child` | Programs per worker before the pool is recreated. OpenCascade holds memory across programs. |
 | `--voxel-resolution`, `--surface-points` | Similarity cost/precision. |
+| `--ignore-gate NAME` | Stop a gate deciding the verdict while it keeps running and reporting. A defect affecting every program (`idempotent` does today) otherwise turns the verdict column into a wall of red that hides what a change actually moved. Repeatable. |
 | `--fail-under` | Exit non-zero below this pass rate, for CI. |
 
 ## Modules

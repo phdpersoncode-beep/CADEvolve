@@ -152,6 +152,33 @@ def _evaluate_path(path_string: str) -> dict[str, Any]:
     return evaluation.to_dict()
 
 
+def apply_ignored_gates(
+    records: list[dict[str, Any]], ignored: set[str]
+) -> list[dict[str, Any]]:
+    """Recompute each record's verdict while disregarding named gates.
+
+    A defect that affects every program -- ``idempotent`` does today -- turns the
+    verdict column into a wall of red that hides the gates a change actually
+    moved.  The gate still runs and still reports; it just stops deciding the
+    verdict, so a team can baseline a known defect and keep a meaningful pass
+    rate.
+    """
+
+    if not ignored:
+        return records
+    for record in records:
+        failed = [
+            gate["name"]
+            for gate in record.get("gates", [])
+            if not gate["passed"]
+            and not gate.get("skipped")
+            and gate["name"] not in ignored
+        ]
+        record["failed_gates"] = failed
+        record["passed"] = not failed
+    return records
+
+
 def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     gates: dict[str, dict[str, int]] = {}
     for record in records:
@@ -307,12 +334,21 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=1.0,
         help="exit non-zero when the pass rate falls below this fraction",
     )
+    parser.add_argument(
+        "--ignore-gate",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="do not let this gate decide the pass/fail verdict (repeatable); "
+        "it still runs and is still counted in the gate table",
+    )
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args(list(argv) if argv is not None else None)
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = _parse_args(argv)
+    ignored = set(args.ignore_gate)
     options = {
         "loop_mode": args.loop_mode,
         "run_geometry": not args.no_geometry,
@@ -355,6 +391,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                             record = _failure_record(
                                 path.name, f"{type(error).__name__}: {error}"
                             )
+                        if ignored:
+                            apply_ignored_gates([record], ignored)
                         records.append(record)
                         completed += 1
                         if not args.quiet:
@@ -387,7 +425,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                         process.kill()
 
     records.sort(key=lambda record: record["name"])
+    records = apply_ignored_gates(records, ignored)
     summary = summarize(records)
+    summary["ignored_gates"] = sorted(ignored)
     summary["seconds"] = time.monotonic() - started
     summary["corpus"] = args.corpus
     summary["loop_mode"] = args.loop_mode
