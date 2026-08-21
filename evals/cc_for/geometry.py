@@ -215,12 +215,22 @@ def compare_metrics(
         if not math.isclose(a, b, rel_tol=relative_tolerance, abs_tol=absolute_tolerance):
             mismatches.append(f"{name}: {a!r} != {b!r}")
 
+    # Coordinates are compared against the part's own size.  A centre of mass that
+    # sits at the origin has no magnitude of its own to be relative to, so a fixed
+    # absolute tolerance would flag 1e-7 against 3e-7 on a part 100 units across.
+    scale = max(left.max_extent, right.max_extent, 1.0)
+    coordinate_tolerance = max(absolute_tolerance, relative_tolerance * scale)
+
     for index, (a, b) in enumerate(zip(left.bounds, right.bounds)):
-        if not math.isclose(a, b, rel_tol=relative_tolerance, abs_tol=absolute_tolerance):
+        if not math.isclose(
+            a, b, rel_tol=relative_tolerance, abs_tol=coordinate_tolerance
+        ):
             mismatches.append(f"bounds[{index}]: {a!r} != {b!r}")
 
     for index, (a, b) in enumerate(zip(left.center_of_mass, right.center_of_mass)):
-        if not math.isclose(a, b, rel_tol=relative_tolerance, abs_tol=absolute_tolerance):
+        if not math.isclose(
+            a, b, rel_tol=relative_tolerance, abs_tol=coordinate_tolerance
+        ):
             mismatches.append(f"center_of_mass[{index}]: {a!r} != {b!r}")
 
     return mismatches

@@ -220,6 +220,32 @@ def chamfer(left_points, right_points) -> tuple[float, float, float]:
     )
 
 
+def sampling_noise_floor(
+    result: Any,
+    *,
+    sample_points: int = DEFAULT_SURFACE_POINTS,
+    tessellation_tolerance: float = DEFAULT_TESSELLATION_TOLERANCE,
+) -> float:
+    """Chamfer between two independent samplings of the *same* surface.
+
+    Two builds of an identical solid can tessellate in a different vertex order,
+    so the area-weighted sampler draws different points and the Chamfer distance
+    between them is non-zero even though the geometry matches exactly.  This
+    returns that noise floor so a gate can be calibrated against it instead of a
+    magic constant.
+    """
+
+    vertices, faces = triangle_mesh(result, tessellation_tolerance)
+    vertices = normalize_mesh(vertices)
+    left = sample_surface(
+        vertices, faces, sample_points=sample_points, random_seed=1_000
+    )
+    right = sample_surface(
+        vertices, faces, sample_points=sample_points, random_seed=2_000
+    )
+    return chamfer(left, right)[0]
+
+
 def iou(left_grid, right_grid) -> float:
     import numpy as np
 

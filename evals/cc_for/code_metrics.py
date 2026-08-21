@@ -226,7 +226,10 @@ def source_parameters(code: str, result_name: str = "result") -> set[str]:
             and value.func.id in namespace_aliases(tree)
         ):
             for keyword in value.keywords:
-                if keyword.arg:
+                # Only a literal keyword introduces a new parameter.  When the
+                # value is an expression its own names are already counted, and
+                # the keyword is just the container's label for them.
+                if keyword.arg and isinstance(keyword.value, ast.Constant):
                     parameters.add(keyword.arg)
         if not isinstance(target, ast.Name) or not _is_pure_data(value, containers):
             continue
@@ -247,7 +250,7 @@ def source_parameters(code: str, result_name: str = "result") -> set[str]:
             and node.func.id in namespace_aliases(tree)
         ):
             for keyword in node.keywords:
-                if keyword.arg:
+                if keyword.arg and isinstance(keyword.value, ast.Constant):
                     parameters.add(keyword.arg)
     parameters.discard(result_name)
     return parameters
@@ -401,6 +404,37 @@ def preamble_layout(
             for child in ast.walk(node)
         )
 
+    # Map each top-level name to the names its definition reads, so a candidate
+    # can be tested for a transitive dependency on loop-built state.
+    definitions: dict[str, set[str]] = {}
+    for stmt in body:
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            if isinstance(stmt.targets[0], ast.Name):
+                definitions[stmt.targets[0].id] = {
+                    child.id
+                    for child in ast.walk(stmt.value)
+                    if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+                }
+
+    def pinned_by_dependency(node: ast.AST) -> bool:
+        """True when the value cannot move ahead of the modelling it follows."""
+
+        pending = {
+            child.id
+            for child in ast.walk(node)
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+        }
+        seen: set[str] = set()
+        while pending:
+            name = pending.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            if name in exempt or _WORKPLANE_NAME.match(name):
+                return True
+            pending |= definitions.get(name, set()) - seen
+        return False
+
     late: list[str] = []
     for stmt in body[first_geometry:]:
         if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
@@ -412,6 +446,7 @@ def preamble_layout(
                 and target.id not in exempt
                 and not target.id.startswith(_GENERATED_PREFIXES)
                 and not aliases_geometry(stmt.value)
+                and not pinned_by_dependency(stmt.value)
                 and _is_pure_data(stmt.value, containers)
             ):
                 late.append(target.id)

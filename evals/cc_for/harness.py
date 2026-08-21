@@ -36,15 +36,23 @@ from utils.canonicalization.cc_for import (
 )
 
 from . import code_metrics
-from .geometry import compare_metrics, shape_metrics
-from .similarity import compare_shapes
+from .geometry import DEFAULT_SURFACE_POINTS, compare_metrics, shape_metrics
+from .similarity import compare_shapes, sampling_noise_floor
 
-# The exact path must be exact: the canonical program replays the identical
-# CadQuery calls, so anything above float noise is a real divergence.
-EXACT_RELATIVE_TOLERANCE = 1e-9
+# The canonical program replays the identical CadQuery calls, so topology counts
+# and face/edge type histograms are required to match *exactly*.  Mass properties
+# get a small relative tolerance instead: OpenCascade's tolerance-driven surface
+# algorithms are not bit-reproducible across two builds of the same solid, and
+# were measured drifting by ~5e-8 relative on filleted and swept parts.
+EXACT_RELATIVE_TOLERANCE = 1e-7
 EXACT_ABSOLUTE_TOLERANCE = 1e-9
 EXACT_MIN_IOU = 0.999
+# Surface Chamfer cannot be held to 1e-9: two builds of the same solid can
+# tessellate in a different vertex order, so the sampler draws different points.
+# The gate calibrates against that measured noise floor and keeps this only as a
+# lower bound for the well-behaved case.
 EXACT_MAX_CHAMFER = 1e-3
+EXACT_CHAMFER_NOISE_MULTIPLE = 3.0
 
 # The quantized path is allowed to move geometry: binarization rounds every
 # numeric literal to an integer, so a small part changes shape noticeably.
@@ -499,11 +507,19 @@ def evaluate_program(
 
     def _shape_identical() -> tuple[bool, dict[str, Any]]:
         scores = compare_shapes(source_result, canonical_result, **similarity_kwargs)
-        ok = scores.voxel_iou >= EXACT_MIN_IOU and scores.chamfer_l2 <= EXACT_MAX_CHAMFER
+        noise = sampling_noise_floor(
+            source_result,
+            sample_points=similarity_kwargs.get(
+                "sample_points", DEFAULT_SURFACE_POINTS
+            ),
+        )
+        limit = max(EXACT_MAX_CHAMFER, EXACT_CHAMFER_NOISE_MULTIPLE * noise)
+        ok = scores.voxel_iou >= EXACT_MIN_IOU and scores.chamfer_l2 <= limit
         return ok, {
             "scores": scores.to_dict(),
             "min_iou": EXACT_MIN_IOU,
-            "max_chamfer": EXACT_MAX_CHAMFER,
+            "sampling_noise_floor": noise,
+            "max_chamfer": limit,
         }
 
     gates.append(_run_gate("shape_identical", _shape_identical))
@@ -662,11 +678,13 @@ def evaluate_program(
                     continue
                 case: dict[str, Any] = {"parameter": source_name}
                 try:
-                    left_result = _result_of(
-                        run(perturbed_source, "pert-source"), result_name
+                    left = shape_metrics(
+                        _result_of(run(perturbed_source, "pert-source"), result_name)
                     )
-                    right_result = _result_of(
-                        run(perturbed_canonical, "pert-canonical"), result_name
+                    right = shape_metrics(
+                        _result_of(
+                            run(perturbed_canonical, "pert-canonical"), result_name
+                        )
                     )
                 except Exception as error:
                     # Some parameters are not freely scalable (a boss larger than
@@ -674,12 +692,20 @@ def evaluate_program(
                     # canonicalization defect, so only a one-sided failure counts.
                     left_ok = right_ok = False
                     try:
-                        run(perturbed_source, "pert-source")
+                        shape_metrics(
+                            _result_of(
+                                run(perturbed_source, "pert-source"), result_name
+                            )
+                        )
                         left_ok = True
                     except Exception:
                         pass
                     try:
-                        run(perturbed_canonical, "pert-canonical")
+                        shape_metrics(
+                            _result_of(
+                                run(perturbed_canonical, "pert-canonical"), result_name
+                            )
+                        )
                         right_ok = True
                     except Exception:
                         pass
@@ -693,10 +719,11 @@ def evaluate_program(
                     cases.append(case)
                     continue
 
-                left = shape_metrics(left_result)
-                right = shape_metrics(right_result)
                 mismatches = compare_metrics(
-                    left, right, relative_tolerance=1e-7, absolute_tolerance=1e-7
+                    left,
+                    right,
+                    relative_tolerance=EXACT_RELATIVE_TOLERANCE,
+                    absolute_tolerance=EXACT_ABSOLUTE_TOLERANCE,
                 )
                 # The perturbation must actually do something, otherwise the gate
                 # would pass on a program that ignores the parameter entirely.
