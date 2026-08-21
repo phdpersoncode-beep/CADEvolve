@@ -67,8 +67,13 @@ QUANTIZED_MAX_CHAMFER = 0.05
 VOXEL_IOU_SLACK = 1.0 - EXACT_MIN_IOU
 
 PERTURBATION_FACTOR = 1.37
-PERTURBATION_MIN_IOU = 0.999
 DEFAULT_MAX_PERTURBATIONS = 3
+# A perturbed rebuild is not a replay of the same calls: the dimensions change, so
+# OpenCascade's algorithms take different paths and accumulate more drift than the
+# ~5e-8 measured on a direct replay.  This gate asks whether the symbolic
+# relationships survived, not whether the rebuild is bit-identical, so it compares
+# mass properties at 1e-6 while still requiring every topology count to match.
+PERTURBATION_RELATIVE_TOLERANCE = 1e-6
 
 # A CAD program can run forever: a corpus program with a data-dependent ``while``,
 # or one of ours once a perturbation pushes a convergence ratio past 1.0.  Every
@@ -271,6 +276,7 @@ def evaluate_program(
     max_perturbations: int = DEFAULT_MAX_PERTURBATIONS,
     execution_timeout: float = DEFAULT_EXECUTION_TIMEOUT,
     max_prefix_checks: int = DEFAULT_MAX_PREFIX_CHECKS,
+    check_determinism: bool = True,
     voxel_resolution: int | None = None,
     surface_points: int | None = None,
     keep_canonical_code: bool = False,
@@ -444,6 +450,7 @@ def evaluate_program(
         for gate_name in (
             "source_executes",
             "canonical_executes",
+            "source_deterministic",
             "topology_identical",
             "shape_identical",
             "prefixes_execute",
@@ -478,19 +485,48 @@ def evaluate_program(
     canonical_gate = _run_gate("canonical_executes", _canonical_executes)
     gates.append(canonical_gate)
 
+    comparison_gates = (
+        "topology_identical",
+        "shape_identical",
+        "prefixes_execute",
+        "quantization_commutes",
+        "quantized_shape_close",
+        "parameter_perturbation",
+    )
+
     if not (source_gate.passed and canonical_gate.passed):
-        for gate_name in (
-            "topology_identical",
-            "shape_identical",
-            "prefixes_execute",
-            "quantization_commutes",
-            "quantized_shape_close",
-            "parameter_perturbation",
-        ):
+        for gate_name in comparison_gates:
             gates.append(_skipped(gate_name, "execution gate failed"))
         evaluation.passed = all(gate.passed for gate in gates)
         evaluation.seconds = time.monotonic() - started
         return evaluation
+
+    # Some corpus programs are not reproducible: OpenCascade can take a different
+    # path on a fillet or boolean between runs and land on a different topology.
+    # Comparing a canonical program against a baseline that does not agree with
+    # itself measures nothing, so those programs are reported, not failed.
+    def _source_deterministic() -> tuple[bool, dict[str, Any]]:
+        first = shape_metrics(source_result)
+        second = shape_metrics(_result_of(run(source, "source-repeat"), result_name))
+        mismatches = compare_metrics(
+            first,
+            second,
+            relative_tolerance=EXACT_RELATIVE_TOLERANCE,
+            absolute_tolerance=EXACT_ABSOLUTE_TOLERANCE,
+        )
+        return not mismatches, {"mismatches": mismatches[:6]}
+
+    if check_determinism:
+        determinism_gate = _run_gate("source_deterministic", _source_deterministic)
+        gates.append(determinism_gate)
+        if not determinism_gate.passed:
+            for gate_name in comparison_gates:
+                gates.append(
+                    _skipped(gate_name, "source program is not reproducible")
+                )
+            evaluation.passed = all(gate.passed for gate in gates)
+            evaluation.seconds = time.monotonic() - started
+            return evaluation
 
     def _topology_identical() -> tuple[bool, dict[str, Any]]:
         left = shape_metrics(source_result)
@@ -730,7 +766,7 @@ def evaluate_program(
                 mismatches = compare_metrics(
                     left,
                     right,
-                    relative_tolerance=EXACT_RELATIVE_TOLERANCE,
+                    relative_tolerance=PERTURBATION_RELATIVE_TOLERANCE,
                     absolute_tolerance=EXACT_ABSOLUTE_TOLERANCE,
                 )
                 # The perturbation must actually do something, otherwise the gate

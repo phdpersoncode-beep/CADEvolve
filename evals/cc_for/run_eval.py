@@ -59,6 +59,7 @@ GATE_ORDER = (
     "chains_lowered",
     "source_executes",
     "canonical_executes",
+    "source_deterministic",
     "topology_identical",
     "shape_identical",
     "prefixes_execute",
@@ -325,6 +326,12 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=24,
         help="prefixes to replay per program (0 = every one); replay is O(n^2)",
     )
+    parser.add_argument(
+        "--no-determinism-check",
+        action="store_true",
+        help="skip re-executing each source program; the check costs one extra "
+        "build but stops a non-reproducible program being blamed on the converter",
+    )
     parser.add_argument("--voxel-resolution", type=int, default=None)
     parser.add_argument("--surface-points", type=int, default=None)
     parser.add_argument("--report", type=Path, default=None, help="write a JSON report")
@@ -359,6 +366,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "surface_points": args.surface_points,
         "execution_timeout": args.execution_timeout,
         "max_prefix_checks": args.max_prefix_checks,
+        "check_determinism": not args.no_determinism_check,
     }
 
     with tempfile.TemporaryDirectory(prefix="cc-for-eval-") as scratch:

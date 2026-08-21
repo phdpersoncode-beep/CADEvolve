@@ -25,6 +25,7 @@ the **canonical** code, and the **solids** both produce.
 | `literals_stable` | No numeric or string literal invented or dropped. |
 | `chains_lowered` | Every modelling call is its own `wpN` assignment. |
 | `source_executes` / `canonical_executes` | Both build a valid shape. |
+| `source_deterministic` | Does the source program build the same solid twice? |
 | `topology_identical` | Solids, shells, faces, wires, edges, vertices, face/edge type histograms, volume, area, bounding box, centre of mass. |
 | `shape_identical` | Voxel IoU ≈ 1 and Chamfer ≈ 0 after normalization. |
 | `prefixes_execute` | Every emitted action prefix runs on its own. |
@@ -58,6 +59,17 @@ transform's own damage:
 Similarly, `parameter_perturbation` counts a case as passing when *both*
 programs fail to build under the same perturbation: not every parameter can be
 scaled freely, and a symmetric failure is still agreement.
+
+A third case is the corpus itself. Some programs are not reproducible —
+OpenCascade can take a different path on a fillet or a boolean between runs and
+land on a different topology, with face counts differing by a factor of five in
+the extreme. Comparing a canonical program against a baseline that does not
+agree with itself measures nothing, so `source_deterministic` re-executes the
+source and, when it disagrees, the comparison gates are reported as not
+applicable. The check catches *consistently* non-reproducible programs; an
+intermittently flaky one can still slip through a single re-run. Pass
+`--ignore-gate source_deterministic` to exclude corpus quality from the verdict,
+or `--no-determinism-check` to skip the extra build entirely.
 
 ## Running it
 
@@ -95,6 +107,7 @@ PYTHONPATH=.:dataset_utils python -m pytest tests/test_cc_for_eval_suite.py -q
 | Flag | Why |
 |---|---|
 | `--execution-timeout` | A CAD program can loop forever, and a perturbed one more easily still. Each execution runs under a `SIGALRM` budget. |
+| `--no-determinism-check` | Skip re-executing each source program. Saves one build per program; costs the ability to tell a flaky corpus program from a converter defect. |
 | `--max-prefix-checks` | Prefix replay is O(n²) CAD calls; long programs are subsampled, first and last always included. |
 | `--tasks-per-child` | Programs per worker before the pool is recreated. OpenCascade holds memory across programs. |
 | `--voxel-resolution`, `--surface-points` | Similarity cost/precision. |
