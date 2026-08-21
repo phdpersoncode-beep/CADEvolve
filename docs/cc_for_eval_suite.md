@@ -202,6 +202,49 @@ Two further observations about the existing gates:
   `"source and CC-for diverged after binarization"`. They did not diverge; both
   failed identically. Three of the 22 edge cases hit this.
 
+## A 1% reproducibility floor sits under any geometry comparison
+
+Chasing the last unattributed gate failure turned up a property of the corpus
+rather than of the converter: **some Zero-to-CAD programs do not build the same
+solid twice.** Re-executing 499 buildable programs and comparing the two results
+against each other:
+
+| | Programs | Share |
+|---|---:|---:|
+| Reproducible | 494 | 99.00% |
+| **Not reproducible** | **5** | **1.00%** |
+
+The disagreements are not float noise:
+
+| Program | First run vs second run |
+|---|---|
+| `0e1aca6c` | 1 shell vs 2; 36 faces vs 53 |
+| `1fe43d5b` | 31 faces vs 25; 45 wires vs 52 |
+| `194558e9` | 37 faces vs 35 |
+| `0d4c40a1` | centre of mass Y flips sign, `-1.9083` vs `+1.9083` |
+| `1821d3ee` | centre of mass moves by 0.075 in X |
+
+`08cde529`, which prompted the investigation, swings between 156 and 28 faces
+after binarization. OpenCascade takes a different path on a fillet or a boolean
+between runs and lands on a different topology.
+
+Two consequences:
+
+1. **Any single-run geometry comparison on this corpus carries ~1% irreducible
+   noise.** A small number of failures has to be checked for reproducibility
+   before it can be attributed to canonicalization. The suite's
+   `source_deterministic` gate does this: it re-executes the source and reports
+   the comparison gates as not applicable when the baseline disagrees with
+   itself. It catches consistently non-reproducible programs; an intermittently
+   flaky one can still pass a single re-run.
+2. **The existing 32-program geometry sample had roughly a 27% chance of
+   containing at least one such program** (1 − 0.99³²), where it would have
+   shown a spurious divergence — or, had one been excluded by hand, hidden a
+   real one.
+
+This is a corpus/toolchain property, not a defect in the PR. It is recorded here
+because it bounds what any geometry gate over this dataset can claim.
+
 ## Binarizer damage is not canonicalization damage
 
 The suite measures the two separately. Comparing each program's post-binarization
@@ -228,7 +271,8 @@ canonicalization.
 
 Independently of the fixes: promote the geometry gate from a 32-program sample
 to a corpus-scale run, since all three correctness defects are invisible to the
-structural scan that does run at 5,000.
+structural scan that does run at 5,000 — and pair it with a reproducibility
+check, because roughly 1% of the corpus cannot serve as its own baseline.
 
 ## Reproducing
 
