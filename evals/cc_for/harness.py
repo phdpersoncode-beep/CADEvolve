@@ -218,7 +218,7 @@ def _scale_numeric_parameter(code: str, parameter: str, factor: float) -> str | 
 
 
 def _perturbable_parameters(
-    source: str, canonical: str, comparison: code_metrics.CodeComparison, report: dict[str, Any]
+    source: str, canonical: str, report: dict[str, Any]
 ) -> list[tuple[str, str]]:
     """Source/canonical name pairs that are plain non-zero numeric parameters."""
 
@@ -671,7 +671,7 @@ def evaluate_program(
     if run_perturbations:
 
         def _parameter_perturbation() -> tuple[bool, dict[str, Any]]:
-            pairs = _perturbable_parameters(source, canonical, comparison, report)
+            pairs = _perturbable_parameters(source, canonical, report)
             if not pairs:
                 return True, {"checked": 0, "reason": "no plain float parameters"}
             cases: list[dict[str, Any]] = []

@@ -682,6 +682,7 @@ def compare_code(
     canonical_loads = load_counts(canonical)
     canonical_attributes = attribute_parameters(canonical)
 
+    canonical_containers = container_roots(canonical)
     lost: list[str] = []
     unused: list[str] = []
     resolved: dict[str, str] = {}
@@ -703,14 +704,14 @@ def compare_code(
         if (
             canonical_loads.get(canonical_name, 0) == 0
             and parameter not in canonical_attributes
-            and parameter not in container_roots(canonical)
+            and parameter not in canonical_containers
         ):
             unused.append(parameter)
 
     # A parameter that the source passed to a CadQuery call but the canonical
     # program passes as a bare literal has been constant-folded away.
     source_loads = load_counts(source)
-    containers = container_roots(source) | container_roots(canonical)
+    containers = container_roots(source) | canonical_containers
     inlined = [
         parameter
         for parameter, canonical_name in resolved.items()
