@@ -74,6 +74,12 @@ parameters and loops while lowering CadQuery chains to explicit `wpN` steps. See
 [`Zero-to-CAD validation report`](docs/cc_for_zero_to_cad_validation.md) for structural,
 exact-solid, executable-prefix, and post-binarization geometry results.
 
+The same converter also emits **CC-step**, documented in
+[`docs/cc_step_canonicalization.md`](docs/cc_step_canonicalization.md). It is CC-for
+with the parameter preamble broken up: each parameter group sits directly above the
+modelling step that reads it, so a step arrives with the dimensions it needs. Select
+it with `parameter_placement: late` in the config, or `--parameter-placement late`.
+
 Install only the converter and validation dependencies with:
 
 ```bash
@@ -84,11 +90,16 @@ An independent evaluation suite for that converter lives in
 [`evals/cc_for/`](evals/cc_for/README.md). It compares the original program, the
 canonicalized program, and the solids both execute to — topology, mass
 properties, voxel IoU and surface Chamfer — alongside AST gates for parameter
-retention, preamble placement and loop preservation. Measured results are in
-[`docs/cc_for_eval_suite.md`](docs/cc_for_eval_suite.md).
+retention, parameter placement and loop preservation. It also checks that
+CADEvolve-C, CC-for and CC-step all describe the same part. Measured results are
+in [`docs/cc_for_eval_suite.md`](docs/cc_for_eval_suite.md) and
+[`docs/cc_step_canonicalization.md`](docs/cc_step_canonicalization.md).
 
 ```bash
 PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval --corpus cases
+PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval --corpus cases \
+    --parameter-placement late
+PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_representations --corpus fixtures
 ```
 
 ### 3) Train / infer / evaluate (Image2CAD VLM)

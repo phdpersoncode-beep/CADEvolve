@@ -1,6 +1,8 @@
 # CC-for canonicalization
 
 This document defines the custom CadQuery representation used by Step-ToCAD.
+The same converter also emits **CC-step**, which differs only in where the named
+parameters go: see [`cc_step_canonicalization.md`](cc_step_canonicalization.md).
 The converter is intentionally AST-based: executing a program and tracing CadQuery
 calls, as the legacy CADEvolve standardizer does, destroys symbolic parameter
 relationships and can freeze parameter-dependent plane orientations into literals.
@@ -11,7 +13,8 @@ CC-for has four required properties:
 
 1. **Named parameters.** Independent and derived parameters remain symbolic and are
    collected into a contiguous preamble immediately after imports whenever moving
-   them is semantics-preserving.
+   them is semantics-preserving. CC-step keeps the same parameters but places each
+   group above the step that reads it instead.
 2. **Loop-aware SSA.** A name with multiple definitions is versioned (`x_1`, `x_2`,
    ...). In loop-preserving mode, loop-carried state is the sole deliberate SSA
    exception because Python needs one stable name across iterations.
@@ -23,7 +26,8 @@ CC-for has four required properties:
 There is exactly one terminal `result = ...` assignment. For Step-ToCAD action
 decomposition, the parameter preamble is one action, every other top-level AST
 statement is one action, and the terminal `result` alias is folded into the preceding
-modeling action.
+modeling action. Under CC-step only the docstring and imports form a standalone
+header; each parameter group joins the modeling action it was placed for.
 
 ## Pipeline
 
@@ -41,7 +45,11 @@ The structural pipeline runs in this order:
 5. Apply deterministic reaching-definition renaming. Every definition of a repeated
    name receives a suffix, including the first definition.
 6. Hoist pure, CAD-independent assignments into a dependency-safe parameter preamble.
-   Loop-local and loop-mutated values stay with their loop in preserve mode.
+   Loop-local and loop-mutated values stay with their loop in preserve mode. Under
+   `parameter_placement: late` this step sinks each parameter to the latest position
+   that still precedes every read of it, producing CC-step. It runs before lowering,
+   so a group lands above a whole fluent chain rather than inside the run of `wpN`
+   steps that chain becomes.
 7. Lower CadQuery Workplane, Sketch, and shape-factory chains without executing them,
    including chains inside helper functions and class methods. `cq.Plane`,
    `cq.Vector`, trigonometry, and other parameter expressions remain symbolic.
