@@ -1483,19 +1483,17 @@ def _sink_parameter_assignments(
 
     ordered = _emit(anchors)
     if not _defines_before_use(ordered, set(name_of.values())):
-        # Settling the unread tail against itself produced an order Python would
-        # reject.  Nothing downstream reads those parameters, so leaving them
-        # where the source had them always recovers a valid program.
+        # An escape hatch, not a second strategy: send every parameter to the
+        # step that follows it in the source instead.  That order is valid by
+        # construction -- a dependency precedes its reader in the source, so it
+        # reaches the same step or an earlier one, and within a step the source
+        # order is kept -- so it always recovers a program Python accepts, at the
+        # cost of sinking nothing.
         report.warnings.append(
-            "Kept unread parameters in source position: sinking them would read "
-            "a name before it is bound"
+            "Kept parameters in source position: sinking them would have read a "
+            "name before it is bound"
         )
-        for index in movable:
-            if not _readers(index) or all(
-                reader in movable_set and anchors.get(reader) is None
-                for reader in _readers(index)
-            ):
-                anchors[index] = _fallback(index)
+        anchors = {index: _fallback(index) for index in movable}
         ordered = _emit(anchors)
 
     report.hoisted_parameters.extend(name_of[index] for index in movable)

@@ -194,6 +194,32 @@ result = plate.faces('>Z').workplane().circle(reach / 8).cutThruAll()
             self.assertIn(name, converted.report.hoisted_parameters, name)
             self.assertGreater(names.index(name), names.index("wp1"), name)
 
+    def test_source_position_fallback_stays_valid(self) -> None:
+        """The escape hatch has to recover a program, not just a warning.
+
+        Placement can only be wrong in one direction -- emitting a read before
+        its binding -- so the converter checks for that and, if it ever sees it,
+        sends every parameter to the step that follows it in the source instead.
+        """
+
+        from dataset_utils.utils.canonicalization import cc_for as module
+
+        source = (FIXTURES / "shelled_pocket.py").read_text(encoding="utf-8")
+        original = module._defines_before_use
+        module._defines_before_use = lambda *args, **kwargs: False
+        try:
+            converted = convert(source)
+        finally:
+            module._defines_before_use = original
+
+        assert any(
+            "source position" in warning for warning in converted.report.warnings
+        ), converted.report.warnings
+        self.assertEqual(converted.report.structural_errors, [])
+        names = top_level_names(converted.code)
+        self.assertLess(names.index("outer_width"), names.index("wp1"))
+        compile(converted.code, "<fallback>", "exec")
+
     def test_structure_contract_holds(self) -> None:
         for fixture in sorted(FIXTURES.glob("*.py")):
             with self.subTest(fixture=fixture.name):
@@ -291,6 +317,19 @@ class LatePlacementGeometryTests(unittest.TestCase):
                     converted.code, parameter_placement="late"
                 )
                 self.assertTrue(prefixes.success, prefixes.to_dict())
+
+    def test_source_position_fallback_builds_the_same_solid(self) -> None:
+        from dataset_utils.utils.canonicalization import cc_for as module
+
+        source = (FIXTURES / "shelled_pocket.py").read_text(encoding="utf-8")
+        original = module._defines_before_use
+        module._defines_before_use = lambda *args, **kwargs: False
+        try:
+            converted = convert(source)
+        finally:
+            module._defines_before_use = original
+        round_trip = validate_round_trip(source, converted.code)
+        self.assertTrue(round_trip.success, round_trip.to_dict())
 
     def test_round_trip_on_cadevolve_p_examples(self) -> None:
         for fixture in sorted(CADEVOLVE_FIXTURES.glob("*.py")):
