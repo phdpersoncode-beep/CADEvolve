@@ -172,6 +172,28 @@ result = part.faces('>Z').workplane().hole(size)
         self.assertEqual([name for name in names if name == "size"], ["size", "size"])
         self.assertLess(names.index("size"), names.index("wp1"))
 
+    def test_bare_math_imports_are_parameter_algebra(self) -> None:
+        """``radians(a)`` has to count as data just as ``math.radians(a)`` does.
+
+        Otherwise the first derived angle looks like the start of modelling and
+        every parameter behind it is stuck where the source happened to put it.
+        """
+
+        source = """
+import cadquery as cq
+from math import cos, radians
+span = 40.0
+angle_deg = 30.0
+reach = span * cos(radians(angle_deg))
+plate = cq.Workplane('XY').box(span, span, 4.0)
+result = plate.faces('>Z').workplane().circle(reach / 8).cutThruAll()
+"""
+        converted = convert(source)
+        names = top_level_names(converted.code)
+        for name in ("angle_deg", "reach"):
+            self.assertIn(name, converted.report.hoisted_parameters, name)
+            self.assertGreater(names.index(name), names.index("wp1"), name)
+
     def test_structure_contract_holds(self) -> None:
         for fixture in sorted(FIXTURES.glob("*.py")):
             with self.subTest(fixture=fixture.name):

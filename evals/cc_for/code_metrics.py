@@ -592,24 +592,28 @@ def late_parameter_layout(
         sizes.append(len(names))
         records.append(ParameterGroup(tuple(names), len(statements)))
 
-        justified = set()
+        # A parameter settles in this group when the group's own statements read
+        # it, when control flow pins it here, or when nothing reads it at all and
+        # so no later group could claim it.  A statement that binds no simple
+        # name -- an attribute write such as ``measures.width = width`` -- has
+        # nothing to reposition and is settled by construction.  Whatever a
+        # settled statement reads is needed here too, which is how a chain of
+        # derived values, a field write, and the retained namespace container all
+        # keep their inputs in their own group.
+        def _settled(stmt: ast.stmt) -> bool:
+            name = _assignment_target(stmt)
+            if name is None:
+                return True
+            return name in justified or name in pinned or not all_reads.get(name)
+
+        justified: set[str] = set()
         for stmt in statements:
             justified |= _deep_loads(stmt)
-        # A pinned parameter is not going anywhere, so whatever it reads is
-        # needed here too -- that is how the retained namespace container keeps
-        # the fields it names in its own group.
-        for stmt in parameters:
-            name = _assignment_target(stmt)
-            if name is not None and name in pinned:
-                justified |= _deep_loads(stmt)
-        # A parameter read by an already-justified parameter of the same group is
-        # justified too: it is a dependency of a value this step needs.
         changed = True
         while changed:
             changed = False
             for stmt in parameters:
-                name = _assignment_target(stmt)
-                if name is None or (name not in justified and name not in pinned):
+                if not _settled(stmt):
                     continue
                 for read in _deep_loads(stmt):
                     if read not in justified:

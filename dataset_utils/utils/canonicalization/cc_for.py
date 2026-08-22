@@ -1022,9 +1022,29 @@ _SAFE_DATA_CALLS = {
 _SAFE_CQ_DATA_CALLS = {"Location", "Plane", "Vector"}
 
 
+def _math_import_names(tree: ast.AST) -> set[str]:
+    """Names bound by ``from math import cos, radians, ...``.
+
+    Calling one of these is parameter algebra, not modelling.  Without this a
+    program that writes ``radians(angle)`` instead of ``math.radians(angle)``
+    looks like it starts building geometry at its first derived angle, and every
+    parameter behind that angle is stuck where the source happened to put it.
+    """
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in {"math", "numpy"}:
+            for alias in node.names:
+                names.add(alias.asname or alias.name)
+    return names
+
+
 class _PureDataExpression(ast.NodeVisitor):
-    def __init__(self, geometry_names: set[str]) -> None:
+    def __init__(
+        self, geometry_names: set[str], safe_calls: set[str] | None = None
+    ) -> None:
         self.geometry_names = geometry_names
+        self.safe_calls = _SAFE_DATA_CALLS | (safe_calls or set())
         self.pure = True
 
     def visit_Name(self, node: ast.Name) -> None:
@@ -1034,7 +1054,7 @@ class _PureDataExpression(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         allowed = False
         if isinstance(node.func, ast.Name):
-            allowed = node.func.id in _SAFE_DATA_CALLS
+            allowed = node.func.id in self.safe_calls
         elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
             if node.func.value.id == "math":
                 allowed = True
@@ -1049,8 +1069,10 @@ class _PureDataExpression(ast.NodeVisitor):
         return
 
 
-def _is_pure_data_expression(node: ast.AST, geometry_names: set[str]) -> bool:
-    visitor = _PureDataExpression(geometry_names)
+def _is_pure_data_expression(
+    node: ast.AST, geometry_names: set[str], safe_calls: set[str] | None = None
+) -> bool:
+    visitor = _PureDataExpression(geometry_names, safe_calls)
     visitor.visit(node)
     return visitor.pure
 
@@ -1211,6 +1233,7 @@ def _movable_parameter_indices(
     result_name: str,
     constructors: set[str] | None = None,
     modules: set[str] | None = None,
+    safe_calls: set[str] | None = None,
 ) -> list[int]:
     """Indices of the statements that may be repositioned as named parameters.
 
@@ -1237,9 +1260,9 @@ def _movable_parameter_indices(
         if name is None or value is None or name == result_name or name in geometry:
             continue
         loads = _loaded_names(value)
-        is_data = _is_pure_data_expression(value, geometry) or _is_namespace_call(
-            value, constructors, modules
-        )
+        is_data = _is_pure_data_expression(
+            value, geometry, safe_calls
+        ) or _is_namespace_call(value, constructors, modules)
         if (
             loads & local_defs <= movable_names
             and not (loads & mutated)
@@ -1269,6 +1292,7 @@ def _hoist_parameter_assignments(
             result_name,
             constructors,
             modules,
+            _math_import_names(tree),
         )
     )
 
@@ -1348,6 +1372,7 @@ def _sink_parameter_assignments(
         result_name,
         constructors,
         modules,
+        _math_import_names(tree),
     )
 
     # Repositioning one of several definitions of a name would change which one
