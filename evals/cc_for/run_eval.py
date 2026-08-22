@@ -53,6 +53,7 @@ GATE_ORDER = (
     "idempotent",
     "parameters_preserved",
     "parameters_hoisted",
+    "parameters_placed_late",
     "loops_preserved",
     "loops_unrolled",
     "literals_stable",
@@ -247,6 +248,13 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
         "binarizer_baseline_iou": _distribution(
             _scores("quantized_shape_close", "voxel_iou", key_path="binarizer_baseline")
         ),
+        "parameter_groups": _distribution(
+            [
+                float(record["code_comparison"]["late_layout"]["group_count"])
+                for record in records
+                if record.get("code_comparison", {}).get("late_layout")
+            ]
+        ),
         "total_loops_preserved": sum(
             record.get("report", {}).get("preserved_loops", 0) for record in records
         ),
@@ -269,6 +277,7 @@ def format_summary(summary: dict[str, Any]) -> str:
     for label in (
         "parameter_retention",
         "preamble_coverage",
+        "parameter_groups",
         "exact_voxel_iou",
         "exact_chamfer_l2",
         "quantized_voxel_iou",
@@ -316,6 +325,13 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         "holds memory across programs, so long runs need periodic recycling",
     )
     parser.add_argument("--loop-mode", choices=("preserve", "unroll"), default="preserve")
+    parser.add_argument(
+        "--parameter-placement",
+        choices=("preamble", "late"),
+        default="preamble",
+        help="'preamble' evaluates CC-for (one parameter block after the "
+        "imports); 'late' evaluates CC-step (a parameter group above each step)",
+    )
     parser.add_argument("--no-geometry", action="store_true", help="AST gates only")
     parser.add_argument("--no-prefixes", action="store_true")
     parser.add_argument("--no-quantization", action="store_true")
@@ -358,6 +374,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     ignored = set(args.ignore_gate)
     options = {
         "loop_mode": args.loop_mode,
+        "parameter_placement": args.parameter_placement,
         "run_geometry": not args.no_geometry,
         "run_prefixes": not args.no_prefixes,
         "run_quantization": not args.no_quantization,
@@ -439,6 +456,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     summary["seconds"] = time.monotonic() - started
     summary["corpus"] = args.corpus
     summary["loop_mode"] = args.loop_mode
+    summary["parameter_placement"] = args.parameter_placement
 
     print()
     print(format_summary(summary))

@@ -687,6 +687,30 @@ def preamble_names(code: str, result_name: str = "result") -> set[str]:
     return names
 
 
+def parameter_block_names(
+    code: str,
+    result_name: str = "result",
+    parameter_placement: str = "preamble",
+) -> set[str]:
+    """Names bound in the canonical parameter blocks, wherever they were placed.
+
+    Under CC-for that is the single preamble; under CC-step it is the union of
+    the per-step groups.  Design-parameter coverage asks whether a dimension is
+    still bound by name, which is the same question either way.
+    """
+
+    if parameter_placement != "late":
+        return preamble_names(code, result_name)
+
+    names: set[str] = set()
+    for parameters, _statements in parameter_groups(code, result_name):
+        for stmt in parameters:
+            name = _assignment_target(stmt)
+            if name is not None:
+                names.add(name)
+    return names
+
+
 def design_parameters(code: str, result_name: str = "result") -> set[str]:
     """Source parameters whose value is a bare number.
 
@@ -819,7 +843,9 @@ class CodeComparison:
     numeric_literals_removed: list[float] = field(default_factory=list)
     string_literals_added: list[str] = field(default_factory=list)
     string_literals_removed: list[str] = field(default_factory=list)
+    parameter_placement: str = "preamble"
     preamble: dict[str, Any] = field(default_factory=dict)
+    late_layout: dict[str, Any] = field(default_factory=dict)
 
     @property
     def parameter_retention(self) -> float:
@@ -829,7 +855,7 @@ class CodeComparison:
 
     @property
     def preamble_coverage(self) -> float:
-        """Share of numeric design parameters bound by name in the preamble."""
+        """Share of numeric design parameters still bound by name in a block."""
 
         if self.design_parameters == 0:
             return 1.0
@@ -855,6 +881,7 @@ def compare_code(
     *,
     report: Mapping[str, Any] | None = None,
     result_name: str = "result",
+    parameter_placement: str = "preamble",
 ) -> CodeComparison:
     report = report or {}
     parameters = source_parameters(source, result_name)
@@ -903,7 +930,9 @@ def compare_code(
     ]
 
     numeric_design = design_parameters(source, result_name)
-    canonical_preamble = preamble_names(canonical, result_name)
+    canonical_preamble = parameter_block_names(
+        canonical, result_name, parameter_placement
+    )
     hoisted: set[str] = set()
     unhoisted: list[str] = []
     for parameter in sorted(numeric_design):
@@ -943,9 +972,17 @@ def compare_code(
         numeric_literals_removed=_multiset_difference(source_numbers, canonical_numbers),
         string_literals_added=_multiset_difference(canonical_strings, source_strings),
         string_literals_removed=_multiset_difference(source_strings, canonical_strings),
+        parameter_placement=parameter_placement,
         preamble=preamble_layout(
             canonical,
             result_name,
             exempt=frozenset(report.get("loop_carried_names", ()) or ()),
         ).to_dict(),
+        late_layout=late_parameter_layout(
+            canonical,
+            result_name,
+            exempt=frozenset(report.get("loop_carried_names", ()) or ()),
+        ).to_dict()
+        if parameter_placement == "late"
+        else {},
     )

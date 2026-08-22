@@ -133,6 +133,7 @@ class ProgramEvaluation:
     name: str
     loop_mode: str
     passed: bool
+    parameter_placement: str = "preamble"
     gates: list[Gate] = field(default_factory=list)
     report: dict[str, Any] = field(default_factory=dict)
     code_comparison: dict[str, Any] = field(default_factory=dict)
@@ -268,6 +269,7 @@ def evaluate_program(
     *,
     name: str = "<program>",
     loop_mode: str = "preserve",
+    parameter_placement: str = "preamble",
     result_name: str = "result",
     run_geometry: bool = True,
     run_prefixes: bool = True,
@@ -296,7 +298,12 @@ def evaluate_program(
     # --- conversion -------------------------------------------------------
     try:
         conversion = canonicalize_code(
-            source, CCForConfig(loop_mode=loop_mode, result_name=result_name)
+            source,
+            CCForConfig(
+                loop_mode=loop_mode,
+                result_name=result_name,
+                parameter_placement=parameter_placement,
+            ),
         )
     except Exception as error:
         gate = Gate(
@@ -309,6 +316,7 @@ def evaluate_program(
             name=name,
             loop_mode=loop_mode,
             passed=False,
+            parameter_placement=parameter_placement,
             gates=[gate],
             seconds=time.monotonic() - started,
         )
@@ -334,7 +342,12 @@ def evaluate_program(
 
     def _idempotent() -> tuple[bool, dict[str, Any]]:
         again = canonicalize_code(
-            canonical, CCForConfig(loop_mode=loop_mode, result_name=result_name)
+            canonical,
+            CCForConfig(
+                loop_mode=loop_mode,
+                result_name=result_name,
+                parameter_placement=parameter_placement,
+            ),
         ).code
         return again == canonical, {"stable": again == canonical}
 
@@ -342,7 +355,11 @@ def evaluate_program(
 
     # --- symbolic representation -----------------------------------------
     comparison = code_metrics.compare_code(
-        source, canonical, report=report, result_name=result_name
+        source,
+        canonical,
+        report=report,
+        result_name=result_name,
+        parameter_placement=parameter_placement,
     )
 
     gates.append(
@@ -361,15 +378,26 @@ def evaluate_program(
         )
     )
 
-    gates.append(
-        _run_gate(
-            "parameters_hoisted",
-            lambda: (
-                bool(comparison.preamble["contiguous"]),
-                comparison.preamble,
-            ),
+    if parameter_placement == "late":
+        gates.append(
+            _run_gate(
+                "parameters_placed_late",
+                lambda: (
+                    bool(comparison.late_layout["grouped"]),
+                    comparison.late_layout,
+                ),
+            )
         )
-    )
+    else:
+        gates.append(
+            _run_gate(
+                "parameters_hoisted",
+                lambda: (
+                    bool(comparison.preamble["contiguous"]),
+                    comparison.preamble,
+                ),
+            )
+        )
 
     if loop_mode == "preserve":
         gates.append(
@@ -439,6 +467,7 @@ def evaluate_program(
     evaluation = ProgramEvaluation(
         name=name,
         loop_mode=loop_mode,
+        parameter_placement=parameter_placement,
         passed=False,
         gates=gates,
         report=report,
@@ -609,7 +638,11 @@ def evaluate_program(
     if run_prefixes:
 
         def _prefixes_execute() -> tuple[bool, dict[str, Any]]:
-            actions = decompose_actions(canonical, result_name=result_name)
+            actions = decompose_actions(
+                canonical,
+                result_name=result_name,
+                parameter_placement=parameter_placement,
+            )
             if max_prefix_checks > 0 and len(actions) > max_prefix_checks:
                 step = len(actions) / max_prefix_checks
                 selected = sorted(
