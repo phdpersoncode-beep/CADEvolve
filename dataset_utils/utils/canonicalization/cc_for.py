@@ -1209,15 +1209,21 @@ def _movable_parameter_indices(
     geometry: set[str],
     mutated: set[str],
     result_name: str,
+    constructors: set[str] | None = None,
+    modules: set[str] | None = None,
 ) -> list[int]:
     """Indices of the statements that may be repositioned as named parameters.
 
     A statement qualifies when it binds one name to a pure data expression that
     reads no geometry, no control-flow-mutated state, and no name that itself had
-    to stay put.  Both placement strategies classify from this one predicate, so
+    to stay put.  The namespace object flattening rebuilds from the parameters it
+    just exposed counts too: it holds nothing but those keywords, so it travels
+    with them.  Both placement strategies classify from this one predicate, so
     CC-for and CC-step always treat the same statements as parameters.
     """
 
+    constructors = constructors or set()
+    modules = modules or set()
     local_defs = {
         name
         for stmt in body
@@ -1231,10 +1237,13 @@ def _movable_parameter_indices(
         if name is None or value is None or name == result_name or name in geometry:
             continue
         loads = _loaded_names(value)
+        is_data = _is_pure_data_expression(value, geometry) or _is_namespace_call(
+            value, constructors, modules
+        )
         if (
             loads & local_defs <= movable_names
             and not (loads & mutated)
-            and _is_pure_data_expression(value, geometry)
+            and is_data
         ):
             movable.append(index)
             movable_names.add(name)
@@ -1250,10 +1259,16 @@ def _hoist_parameter_assignments(
     mutation_collector = _ControlFlowMutationCollector()
     mutation_collector.visit(tree)
 
+    constructors, modules = _simple_namespace_aliases(tree)
     docstrings, imports, body = _split_module_header(tree)
     movable = set(
         _movable_parameter_indices(
-            body, geometry, mutation_collector.mutated, result_name
+            body,
+            geometry,
+            mutation_collector.mutated,
+            result_name,
+            constructors,
+            modules,
         )
     )
 
@@ -1292,6 +1307,22 @@ def _deep_loaded_names(node: ast.AST) -> set[str]:
     }
 
 
+def _defines_before_use(statements: Sequence[ast.stmt], tracked: set[str]) -> bool:
+    """True when every tracked name is bound before the statement that reads it.
+
+    Module-level binding order is the question, so this reads scoped names: a
+    ``def`` or ``class`` body resolves its own locals at call time and a parameter
+    that merely shares a name with a module-level one is not a read of it.
+    """
+
+    bound: set[str] = set()
+    for stmt in statements:
+        if (_loaded_names(stmt) & tracked) - bound:
+            return False
+        bound |= _assigned_names(stmt)
+    return True
+
+
 def _sink_parameter_assignments(
     tree: ast.Module, report: CCForReport, result_name: str
 ) -> ast.Module:
@@ -1308,9 +1339,15 @@ def _sink_parameter_assignments(
     mutation_collector = _ControlFlowMutationCollector()
     mutation_collector.visit(tree)
 
+    constructors, modules = _simple_namespace_aliases(tree)
     docstrings, imports, body = _split_module_header(tree)
     candidates = _movable_parameter_indices(
-        body, geometry, mutation_collector.mutated, result_name
+        body,
+        geometry,
+        mutation_collector.mutated,
+        result_name,
+        constructors,
+        modules,
     )
 
     # Repositioning one of several definitions of a name would change which one
@@ -1332,56 +1369,122 @@ def _sink_parameter_assignments(
     fixed = [index for index in range(len(body)) if index not in movable_set]
 
     def _fallback(index: int) -> int | None:
-        """Where an unread parameter goes: the next step, else the last one."""
+        """Where a parameter with nothing to anchor to goes: the next step."""
 
         following = [anchor for anchor in fixed if anchor > index]
         if following:
             return following[0]
         return fixed[-1] if fixed else None
 
-    # Descending order lets every reader's anchor be known before its dependency
-    # is anchored, because a read always follows the definition it reads.
+    def _readers(index: int) -> list[int]:
+        name = name_of[index]
+        return [
+            reader
+            for reader in range(index + 1, len(body))
+            if name in reads[reader]
+        ]
+
+    def _dependencies(index: int) -> list[int]:
+        return [
+            other
+            for other in movable
+            if other < index and name_of[other] in reads[index]
+        ]
+
+    # The latest legal position for a parameter is the first modelling statement
+    # that reads it, or -- when only other parameters read it -- the position
+    # those parameters were themselves pushed to.  Descending order works because
+    # a read always follows the definition it reads.
     anchors: dict[int, int | None] = {}
     for index in sorted(movable, reverse=True):
-        name = name_of[index]
-        candidates_for_index: list[int] = []
-        for reader in range(index + 1, len(body)):
-            if name not in reads[reader]:
-                continue
-            if reader in movable_set:
-                resolved = anchors.get(reader)
-                if resolved is not None:
-                    candidates_for_index.append(resolved)
+        bounds = [
+            anchors[reader] if reader in movable_set else reader
+            for reader in _readers(index)
+            if reader not in movable_set or anchors.get(reader) is not None
+        ]
+        anchors[index] = min(bounds) if bounds else None
+
+    # What is left is unread: nothing in the program constrains where it goes.
+    # Flattening leaves exactly one of these behind -- the namespace
+    # compatibility object -- and pinning it to the first step would pin every
+    # field it names along with it.  Settle these against each other instead,
+    # taking the last position their dependencies reached, or failing that the
+    # first position a reader reached.  Each round can only fill in a position
+    # that is still open, so the loop runs at most once per parameter.
+    unresolved = [index for index in movable if anchors[index] is None]
+    while unresolved:
+        progressed = []
+        for index in unresolved:
+            settled = [
+                anchors[other]
+                for other in _dependencies(index)
+                if anchors.get(other) is not None
+            ]
+            if settled:
+                anchors[index] = max(settled)
             else:
-                candidates_for_index.append(reader)
-        anchors[index] = min(candidates_for_index) if candidates_for_index else _fallback(index)
+                reader_anchors = [
+                    anchors[reader]
+                    for reader in _readers(index)
+                    if reader in movable_set and anchors.get(reader) is not None
+                ]
+                anchors[index] = min(reader_anchors) if reader_anchors else None
+            if anchors[index] is None:
+                progressed.append(index)
+        if len(progressed) == len(unresolved):
+            break
+        unresolved = progressed
+    for index in unresolved:
+        anchors[index] = _fallback(index)
 
-    groups: dict[int, list[ast.stmt]] = defaultdict(list)
-    trailing: list[ast.stmt] = []
-    for index in movable:
-        anchor = anchors[index]
-        if anchor is None:
-            trailing.append(body[index])
-        else:
-            groups[anchor].append(body[index])
+    def _emit(placement: Mapping[int, int | None]) -> list[ast.stmt]:
+        grouped: dict[int, list[ast.stmt]] = defaultdict(list)
+        trailing: list[ast.stmt] = []
+        for index in movable:
+            anchor = placement[index]
+            if anchor is None:
+                trailing.append(body[index])
+            else:
+                grouped[anchor].append(body[index])
 
-    ordered: list[ast.stmt] = []
-    for index, stmt in enumerate(body):
-        if index in movable_set:
-            continue
-        ordered.extend(groups.get(index, ()))
-        ordered.append(stmt)
-    ordered.extend(trailing)
+        emitted: list[ast.stmt] = []
+        for index, stmt in enumerate(body):
+            if index in movable_set:
+                continue
+            emitted.extend(grouped.get(index, ()))
+            emitted.append(stmt)
+        emitted.extend(trailing)
+        return emitted
+
+    ordered = _emit(anchors)
+    if not _defines_before_use(ordered, set(name_of.values())):
+        # Settling the unread tail against itself produced an order Python would
+        # reject.  Nothing downstream reads those parameters, so leaving them
+        # where the source had them always recovers a valid program.
+        report.warnings.append(
+            "Kept unread parameters in source position: sinking them would read "
+            "a name before it is bound"
+        )
+        for index in movable:
+            if not _readers(index) or all(
+                reader in movable_set and anchors.get(reader) is None
+                for reader in _readers(index)
+            ):
+                anchors[index] = _fallback(index)
+        ordered = _emit(anchors)
 
     report.hoisted_parameters.extend(name_of[index] for index in movable)
-    for anchor in sorted(groups):
-        report.parameter_groups.append(
-            [
-                name
-                for stmt in groups[anchor]
-                if (name := _simple_assignment_name(stmt)) is not None
-            ]
-        )
+    moved = set(name_of.values())
+    current: list[str] = []
+    for stmt in ordered:
+        name = _simple_assignment_name(stmt)
+        if name is not None and name in moved:
+            current.append(name)
+        elif current:
+            report.parameter_groups.append(current)
+            current = []
+    if current:
+        report.parameter_groups.append(current)
 
     tree.body = docstrings + imports + ordered
     return tree

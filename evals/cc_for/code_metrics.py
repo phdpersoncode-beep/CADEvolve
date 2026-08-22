@@ -344,6 +344,45 @@ def control_flow_bound_names(code: str) -> set[str]:
     return names
 
 
+def _is_header_statement(stmt: ast.stmt) -> bool:
+    """Imports and the module docstring precede any parameter block."""
+
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        return True
+    return (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Constant)
+        and isinstance(stmt.value.value, str)
+    )
+
+
+def _is_geometry_statement(
+    stmt: ast.stmt,
+    containers: frozenset[str] | set[str],
+    result_name: str,
+) -> bool:
+    if _is_header_statement(stmt):
+        return False
+    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+        target = stmt.targets[0]
+        if isinstance(target, ast.Name) and (
+            _WORKPLANE_NAME.match(target.id) or target.id == result_name
+        ):
+            return True
+        return not _is_pure_data(stmt.value, containers)
+    return True  # loops, defs, classes, expressions: modelling territory
+
+
+def _deep_loads(node: ast.AST) -> set[str]:
+    """Every ``Load`` name below ``node``, function and lambda bodies included."""
+
+    return {
+        child.id
+        for child in ast.walk(node)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+    }
+
+
 def preamble_layout(
     code: str,
     result_name: str = "result",
@@ -361,27 +400,10 @@ def preamble_layout(
     exempt = set(exempt) | control_flow_bound_names(code) | container_roots(code)
 
     def is_header(stmt: ast.stmt) -> bool:
-        """Imports and the module docstring precede the parameter block."""
-
-        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-            return True
-        return (
-            isinstance(stmt, ast.Expr)
-            and isinstance(stmt.value, ast.Constant)
-            and isinstance(stmt.value.value, str)
-        )
+        return _is_header_statement(stmt)
 
     def is_geometry_statement(stmt: ast.stmt) -> bool:
-        if is_header(stmt):
-            return False
-        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
-            target = stmt.targets[0]
-            if isinstance(target, ast.Name) and (
-                _WORKPLANE_NAME.match(target.id) or target.id == result_name
-            ):
-                return True
-            return not _is_pure_data(stmt.value, containers)
-        return True  # loops, defs, classes, expressions: modelling territory
+        return _is_geometry_statement(stmt, containers, result_name)
 
     imports = 0
     for stmt in body:
@@ -458,6 +480,164 @@ def preamble_layout(
         contiguous=not late,
         late_parameters=tuple(late),
     )
+
+
+@dataclass(frozen=True)
+class ParameterGroup:
+    """One run of parameter assignments and the modelling step it introduces."""
+
+    parameters: tuple[str, ...]
+    step_size: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class LateParameterLayout:
+    """Whether every parameter sits directly above the step that consumes it."""
+
+    parameter_count: int
+    group_count: int
+    first_group_size: int
+    largest_group: int
+    grouped: bool
+    early_parameters: tuple[str, ...] = ()
+    unread_parameters: tuple[str, ...] = ()
+    groups: tuple[dict[str, Any], ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def parameter_groups(
+    code: str, result_name: str = "result"
+) -> list[tuple[list[ast.stmt], list[ast.stmt]]]:
+    """Split top-level code into ``(parameters, modelling statements)`` groups.
+
+    A group ends where the next parameter assignment begins, so the modelling
+    statements of a group are exactly the ones its parameters were placed for.
+    """
+
+    tree = ast.parse(code)
+    containers = namespace_aliases(tree) | math_imports(tree)
+    groups: list[tuple[list[ast.stmt], list[ast.stmt]]] = []
+    pending: list[ast.stmt] = []
+    seen_modelling = False
+
+    for stmt in tree.body:
+        if _is_header_statement(stmt) and not seen_modelling and not pending:
+            continue
+        if _is_geometry_statement(stmt, containers, result_name):
+            seen_modelling = True
+            if pending or not groups:
+                groups.append((pending, [stmt]))
+                pending = []
+            else:
+                groups[-1][1].append(stmt)
+        else:
+            pending.append(stmt)
+
+    if pending:
+        if groups:
+            groups[-1][0].extend(pending)
+        else:
+            groups.append((pending, []))
+    return groups
+
+
+def late_parameter_layout(
+    code: str,
+    result_name: str = "result",
+    exempt: frozenset[str] | set[str] = frozenset(),
+) -> LateParameterLayout:
+    """Check that no parameter could have been pushed into a later group.
+
+    A parameter is justified where it stands when the modelling statements of its
+    own group read it, or when another justified parameter of the same group does.
+    Anything else was defined earlier than it had to be.  A parameter that is
+    pinned by control flow, or that nothing reads at all, has no later anchor to
+    move to and is reported rather than counted against the layout.
+    """
+
+    tree = ast.parse(code)
+    containers = namespace_aliases(tree) | math_imports(tree)
+    pinned = set(exempt) | control_flow_bound_names(code) | container_roots(code)
+
+    groups = parameter_groups(code, result_name)
+    all_reads: dict[str, int] = {}
+    for stmt in tree.body:
+        for name in _deep_loads(stmt):
+            all_reads[name] = all_reads.get(name, 0) + 1
+
+    early: list[str] = []
+    unread: list[str] = []
+    records: list[ParameterGroup] = []
+    sizes: list[int] = []
+
+    for parameters, statements in groups:
+        names = [
+            name
+            for stmt in parameters
+            if (name := _assignment_target(stmt)) is not None
+        ]
+        sizes.append(len(names))
+        records.append(ParameterGroup(tuple(names), len(statements)))
+
+        justified = set()
+        for stmt in statements:
+            justified |= _deep_loads(stmt)
+        # A pinned parameter is not going anywhere, so whatever it reads is
+        # needed here too -- that is how the retained namespace container keeps
+        # the fields it names in its own group.
+        for stmt in parameters:
+            name = _assignment_target(stmt)
+            if name is not None and name in pinned:
+                justified |= _deep_loads(stmt)
+        # A parameter read by an already-justified parameter of the same group is
+        # justified too: it is a dependency of a value this step needs.
+        changed = True
+        while changed:
+            changed = False
+            for stmt in parameters:
+                name = _assignment_target(stmt)
+                if name is None or (name not in justified and name not in pinned):
+                    continue
+                for read in _deep_loads(stmt):
+                    if read not in justified:
+                        justified.add(read)
+                        changed = True
+
+        for name in names:
+            if name in justified or name in pinned:
+                continue
+            if not all_reads.get(name):
+                unread.append(name)
+                continue
+            early.append(name)
+
+    return LateParameterLayout(
+        parameter_count=sum(sizes),
+        group_count=sum(1 for size in sizes if size),
+        first_group_size=sizes[0] if sizes else 0,
+        largest_group=max(sizes, default=0),
+        grouped=not early,
+        early_parameters=tuple(early),
+        unread_parameters=tuple(unread),
+        groups=tuple(record.to_dict() for record in records),
+    )
+
+
+def _assignment_target(stmt: ast.stmt) -> str | None:
+    if (
+        isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+    ):
+        return stmt.targets[0].id
+    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+        return stmt.target.id
+    return None
 
 
 def container_roots(code: str) -> set[str]:
