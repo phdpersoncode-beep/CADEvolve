@@ -19,6 +19,7 @@ from typing import Any, Iterable, Literal, Mapping, MutableMapping, Sequence
 
 
 LoopMode = Literal["preserve", "unroll"]
+ParameterPlacement = Literal["preamble", "late"]
 
 
 @dataclass(frozen=True)
@@ -33,10 +34,15 @@ class CCForConfig:
     hoist_parameters: bool = True
     explicit_workplanes: bool = True
     result_name: str = "result"
+    parameter_placement: ParameterPlacement = "preamble"
 
     def __post_init__(self) -> None:
         if self.loop_mode not in {"preserve", "unroll"}:
             raise ValueError(f"Unsupported loop mode: {self.loop_mode!r}")
+        if self.parameter_placement not in {"preamble", "late"}:
+            raise ValueError(
+                f"Unsupported parameter placement: {self.parameter_placement!r}"
+            )
         if self.max_unroll_iterations < 1:
             raise ValueError("max_unroll_iterations must be positive")
 
@@ -46,6 +52,7 @@ class CCForReport:
     """Machine-readable record of transformations and deliberate exceptions."""
 
     loop_mode: LoopMode
+    parameter_placement: ParameterPlacement = "preamble"
     flattened_namespaces: dict[str, dict[str, str]] = field(default_factory=dict)
     unrolled_loops: int = 0
     preserved_loops: int = 0
@@ -53,6 +60,7 @@ class CCForReport:
     versioned_names: dict[str, list[str]] = field(default_factory=dict)
     loop_carried_names: list[str] = field(default_factory=list)
     hoisted_parameters: list[str] = field(default_factory=list)
+    parameter_groups: list[list[str]] = field(default_factory=list)
     workplane_steps: int = 0
     structural_errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -1173,15 +1181,13 @@ class _ControlFlowMutationCollector(ast.NodeVisitor):
         return
 
 
-def _hoist_parameter_assignments(
-    tree: ast.Module, report: CCForReport, result_name: str
-) -> ast.Module:
-    geometry = _infer_top_level_geometry_names(tree, result_name)
-    mutation_collector = _ControlFlowMutationCollector()
-    mutation_collector.visit(tree)
+def _split_module_header(
+    tree: ast.Module,
+) -> tuple[list[ast.stmt], list[ast.stmt], list[ast.stmt]]:
+    """Separate the module docstring and imports from the statements that move."""
 
-    imports: list[ast.stmt] = []
     docstrings: list[ast.stmt] = []
+    imports: list[ast.stmt] = []
     body: list[ast.stmt] = []
     for index, stmt in enumerate(tree.body):
         if (
@@ -1195,39 +1201,189 @@ def _hoist_parameter_assignments(
             imports.append(stmt)
         else:
             body.append(stmt)
+    return docstrings, imports, body
+
+
+def _movable_parameter_indices(
+    body: Sequence[ast.stmt],
+    geometry: set[str],
+    mutated: set[str],
+    result_name: str,
+) -> list[int]:
+    """Indices of the statements that may be repositioned as named parameters.
+
+    A statement qualifies when it binds one name to a pure data expression that
+    reads no geometry, no control-flow-mutated state, and no name that itself had
+    to stay put.  Both placement strategies classify from this one predicate, so
+    CC-for and CC-step always treat the same statements as parameters.
+    """
 
     local_defs = {
         name
         for stmt in body
-        for name in ([ _simple_assignment_name(stmt) ] if _simple_assignment_name(stmt) else [])
+        if (name := _simple_assignment_name(stmt)) is not None
     }
-    hoisted_names: set[str] = set()
-    parameters: list[ast.stmt] = []
-    remainder: list[ast.stmt] = []
-
-    for stmt in body:
+    movable_names: set[str] = set()
+    movable: list[int] = []
+    for index, stmt in enumerate(body):
         name = _simple_assignment_name(stmt)
         value = _assignment_value(stmt)
         if name is None or value is None or name == result_name or name in geometry:
-            remainder.append(stmt)
             continue
-
         loads = _loaded_names(value)
-        local_dependencies = loads & local_defs
-        dependencies_ready = local_dependencies <= hoisted_names
-        is_hoistable = (
-            dependencies_ready
-            and not (loads & mutation_collector.mutated)
+        if (
+            loads & local_defs <= movable_names
+            and not (loads & mutated)
             and _is_pure_data_expression(value, geometry)
+        ):
+            movable.append(index)
+            movable_names.add(name)
+    return movable
+
+
+def _hoist_parameter_assignments(
+    tree: ast.Module, report: CCForReport, result_name: str
+) -> ast.Module:
+    """CC-for placement: one contiguous parameter preamble after the imports."""
+
+    geometry = _infer_top_level_geometry_names(tree, result_name)
+    mutation_collector = _ControlFlowMutationCollector()
+    mutation_collector.visit(tree)
+
+    docstrings, imports, body = _split_module_header(tree)
+    movable = set(
+        _movable_parameter_indices(
+            body, geometry, mutation_collector.mutated, result_name
         )
-        if is_hoistable:
-            parameters.append(stmt)
-            hoisted_names.add(name)
-            report.hoisted_parameters.append(name)
-        else:
-            remainder.append(stmt)
+    )
+
+    parameters = [body[index] for index in sorted(movable)]
+    remainder = [stmt for index, stmt in enumerate(body) if index not in movable]
+    report.hoisted_parameters.extend(
+        name
+        for stmt in parameters
+        if (name := _simple_assignment_name(stmt)) is not None
+    )
+    if parameters:
+        report.parameter_groups.append(
+            [
+                name
+                for stmt in parameters
+                if (name := _simple_assignment_name(stmt)) is not None
+            ]
+        )
 
     tree.body = docstrings + imports + parameters + remainder
+    return tree
+
+
+def _deep_loaded_names(node: ast.AST) -> set[str]:
+    """Every ``Load`` name below ``node``, including nested function scopes.
+
+    Reader detection has to be conservative: missing a read would let a parameter
+    sink past the statement that needs it.  Descending into ``def`` bodies and
+    lambdas can only pull an anchor earlier, which is always safe.
+    """
+
+    return {
+        child.id
+        for child in ast.walk(node)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+    }
+
+
+def _sink_parameter_assignments(
+    tree: ast.Module, report: CCForReport, result_name: str
+) -> ast.Module:
+    """CC-step placement: each parameter group sits above the step that uses it.
+
+    Every movable parameter is anchored to the earliest top-level statement that
+    reads it, resolving reads through other parameters so a chain such as
+    ``a -> b -> box(b)`` lands as a unit.  Parameters sharing an anchor keep their
+    source order, which is dependency order because a parameter is only movable
+    once its own dependencies are.
+    """
+
+    geometry = _infer_top_level_geometry_names(tree, result_name)
+    mutation_collector = _ControlFlowMutationCollector()
+    mutation_collector.visit(tree)
+
+    docstrings, imports, body = _split_module_header(tree)
+    candidates = _movable_parameter_indices(
+        body, geometry, mutation_collector.mutated, result_name
+    )
+
+    # Repositioning one of several definitions of a name would change which one
+    # reaches a use, so a redefined name stays exactly where the source put it.
+    definition_counts = Counter(
+        name
+        for stmt in body
+        if (name := _simple_assignment_name(stmt)) is not None
+    )
+    movable = [
+        index
+        for index in candidates
+        if definition_counts[_simple_assignment_name(body[index])] == 1
+    ]
+    movable_set = set(movable)
+    name_of = {index: _simple_assignment_name(body[index]) for index in movable}
+
+    reads = [_deep_loaded_names(stmt) for stmt in body]
+    fixed = [index for index in range(len(body)) if index not in movable_set]
+
+    def _fallback(index: int) -> int | None:
+        """Where an unread parameter goes: the next step, else the last one."""
+
+        following = [anchor for anchor in fixed if anchor > index]
+        if following:
+            return following[0]
+        return fixed[-1] if fixed else None
+
+    # Descending order lets every reader's anchor be known before its dependency
+    # is anchored, because a read always follows the definition it reads.
+    anchors: dict[int, int | None] = {}
+    for index in sorted(movable, reverse=True):
+        name = name_of[index]
+        candidates_for_index: list[int] = []
+        for reader in range(index + 1, len(body)):
+            if name not in reads[reader]:
+                continue
+            if reader in movable_set:
+                resolved = anchors.get(reader)
+                if resolved is not None:
+                    candidates_for_index.append(resolved)
+            else:
+                candidates_for_index.append(reader)
+        anchors[index] = min(candidates_for_index) if candidates_for_index else _fallback(index)
+
+    groups: dict[int, list[ast.stmt]] = defaultdict(list)
+    trailing: list[ast.stmt] = []
+    for index in movable:
+        anchor = anchors[index]
+        if anchor is None:
+            trailing.append(body[index])
+        else:
+            groups[anchor].append(body[index])
+
+    ordered: list[ast.stmt] = []
+    for index, stmt in enumerate(body):
+        if index in movable_set:
+            continue
+        ordered.extend(groups.get(index, ()))
+        ordered.append(stmt)
+    ordered.extend(trailing)
+
+    report.hoisted_parameters.extend(name_of[index] for index in movable)
+    for anchor in sorted(groups):
+        report.parameter_groups.append(
+            [
+                name
+                for stmt in groups[anchor]
+                if (name := _simple_assignment_name(stmt)) is not None
+            ]
+        )
+
+    tree.body = docstrings + imports + ordered
     return tree
 
 
@@ -2242,7 +2398,9 @@ def canonicalize_code(
     """Convert one top-level CadQuery script into the CC-for representation."""
 
     config = config or CCForConfig()
-    report = CCForReport(loop_mode=config.loop_mode)
+    report = CCForReport(
+        loop_mode=config.loop_mode, parameter_placement=config.parameter_placement
+    )
     tree = ast.parse(source)
     compile(tree, "<source>", "exec")
 
@@ -2261,7 +2419,10 @@ def canonicalize_code(
         tree = _SSARenamer(tree, report, config.result_name).transform(tree)
 
     if config.hoist_parameters:
-        tree = _hoist_parameter_assignments(tree, report, config.result_name)
+        if config.parameter_placement == "late":
+            tree = _sink_parameter_assignments(tree, report, config.result_name)
+        else:
+            tree = _hoist_parameter_assignments(tree, report, config.result_name)
 
     if config.explicit_workplanes:
         tree = _WorkplaneLowerer(tree, report, config.result_name).transform(tree)
@@ -2321,6 +2482,8 @@ __all__ = [
     "CCForReport",
     "CanonicalAction",
     "CanonicalizationResult",
+    "LoopMode",
+    "ParameterPlacement",
     "canonicalize_code",
     "decompose_actions",
     "validate_structure",
