@@ -531,8 +531,14 @@ def _defines_geometry_state(code: str, result_name: str) -> bool:
     return finder.found
 
 
-def validate_prefixes(code: str, result_name: str = "result") -> PrefixValidation:
-    actions = decompose_actions(code, result_name=result_name)
+def validate_prefixes(
+    code: str,
+    result_name: str = "result",
+    parameter_placement: str = "preamble",
+) -> PrefixValidation:
+    actions = decompose_actions(
+        code, result_name=result_name, parameter_placement=parameter_placement
+    )
     if not actions:
         return PrefixValidation(success=False, checked_prefixes=0, error="no actions")
 

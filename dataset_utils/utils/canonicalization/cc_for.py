@@ -2433,10 +2433,11 @@ def canonicalize_code(
     return CanonicalizationResult(code=code, report=report)
 
 
-def decompose_actions(code: str, result_name: str = "result") -> list[CanonicalAction]:
-    """Split CC-for code into the Step-ToCAD top-level action representation."""
+def _decompose_preamble_actions(
+    tree: ast.Module, result_name: str
+) -> tuple[list[ast.stmt], list[ast.stmt]]:
+    """CC-for split: imports and the leading parameter block form one action."""
 
-    tree = ast.parse(code)
     preamble: list[ast.stmt] = []
     statements: list[ast.stmt] = []
     seen_modeling = False
@@ -2455,25 +2456,93 @@ def decompose_actions(code: str, result_name: str = "result") -> list[CanonicalA
             continue
         seen_modeling = True
         statements.append(stmt)
+    return preamble, statements
+
+
+def _decompose_late_actions(
+    tree: ast.Module, result_name: str
+) -> tuple[list[ast.stmt], list[list[ast.stmt]]]:
+    """CC-step split: every parameter group joins the step it was placed for.
+
+    Only the docstring and imports stay in the header; a parameter that sits
+    above a modelling statement is part of that step's action, which is the whole
+    point of placing it there.
+    """
+
+    geometry = _infer_top_level_geometry_names(tree, result_name)
+    header: list[ast.stmt] = []
+    groups: list[list[ast.stmt]] = []
+    pending: list[ast.stmt] = []
+    seen_modeling = False
+
+    for index, stmt in enumerate(tree.body):
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)) or (
+            index == 0
+            and isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        ):
+            if not seen_modeling:
+                header.append(stmt)
+                continue
+
+        name = _simple_assignment_name(stmt)
+        value = _assignment_value(stmt)
+        is_parameter = (
+            name is not None
+            and value is not None
+            and name != result_name
+            and name not in geometry
+            and not _expression_uses_geometry(value, geometry)
+        )
+        if is_parameter:
+            pending.append(stmt)
+            continue
+
+        seen_modeling = True
+        groups.append([*pending, stmt])
+        pending = []
+
+    if pending:
+        if groups:
+            groups[-1].extend(pending)
+        else:
+            header.extend(pending)
+    return header, groups
+
+
+def decompose_actions(
+    code: str,
+    result_name: str = "result",
+    parameter_placement: ParameterPlacement = "preamble",
+) -> list[CanonicalAction]:
+    """Split canonical code into the Step-ToCAD top-level action representation."""
+
+    tree = ast.parse(code)
+    if parameter_placement == "late":
+        header, groups = _decompose_late_actions(tree, result_name)
+    else:
+        header, statements = _decompose_preamble_actions(tree, result_name)
+        groups = [[stmt] for stmt in statements]
 
     actions: list[CanonicalAction] = []
-    if preamble:
+    if header:
         actions.append(
             CanonicalAction(
                 kind="preamble",
-                code=ast.unparse(ast.Module(body=preamble, type_ignores=[])),
+                code=ast.unparse(ast.Module(body=header, type_ignores=[])),
             )
         )
 
-    for stmt in statements:
-        stmt_code = ast.unparse(stmt)
-        if _is_terminal_assignment(stmt, result_name) and actions:
+    for group in groups:
+        group_code = ast.unparse(ast.Module(body=group, type_ignores=[]))
+        if len(group) == 1 and _is_terminal_assignment(group[0], result_name) and actions:
             previous = actions[-1]
             actions[-1] = CanonicalAction(
-                kind=previous.kind, code=f"{previous.code}\n{stmt_code}"
+                kind=previous.kind, code=f"{previous.code}\n{group_code}"
             )
         else:
-            actions.append(CanonicalAction(kind="statement", code=stmt_code))
+            actions.append(CanonicalAction(kind="statement", code=group_code))
     return actions
 
 
