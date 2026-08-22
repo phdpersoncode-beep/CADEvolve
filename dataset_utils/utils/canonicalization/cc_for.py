@@ -81,6 +81,34 @@ class CanonicalAction:
     code: str
 
 
+def _load(name: str) -> ast.Name:
+    """A ``Load`` reference to ``name`` (locations filled in later)."""
+
+    return ast.Name(id=name, ctx=ast.Load())
+
+
+def _store(name: str) -> ast.Name:
+    """A ``Store`` target for ``name`` (locations filled in later)."""
+
+    return ast.Name(id=name, ctx=ast.Store())
+
+
+def _assign(
+    name: str, value: ast.expr, location: ast.AST | None = None
+) -> ast.Assign:
+    """``name = value``; copy ``location`` onto the statement when given.
+
+    Only the assignment node takes the location, exactly as the hand-written
+    ``ast.copy_location(ast.Assign(...), stmt)`` calls did; the freshly built
+    children are left for :func:`ast.fix_missing_locations` in the same way.
+    """
+
+    node = ast.Assign(targets=[_store(name)], value=value)
+    if location is not None:
+        ast.copy_location(node, location)
+    return node
+
+
 def _target_names(target: ast.AST) -> list[str]:
     if isinstance(target, ast.Name):
         return [target.id]
@@ -90,6 +118,37 @@ def _target_names(target: ast.AST) -> list[str]:
             names.extend(_target_names(element))
         return names
     return []
+
+
+class _SkipNestedScopes(ast.NodeVisitor):
+    """A visitor that never descends into nested function or class scopes.
+
+    Every module-level analysis here reasons about the top-level block only; a
+    name bound inside a ``def`` or ``class`` is that scope's local, not the
+    module's, so these traversals stop at the boundary.
+    """
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        return
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        return
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return
+
+
+class _KeepNestedScopes(ast.NodeTransformer):
+    """A transformer that leaves nested function and class scopes untouched."""
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        return node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        return node
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
+        return node
 
 
 class _ScopedNameCollector(ast.NodeVisitor):
@@ -152,6 +211,26 @@ def _assignment_value(stmt: ast.stmt) -> ast.AST | None:
     return None
 
 
+def _names_of(statements: Iterable[ast.stmt]) -> list[str]:
+    """The simple-assignment target of each statement that has one, in order."""
+
+    return [
+        name
+        for stmt in statements
+        if (name := _simple_assignment_name(stmt)) is not None
+    ]
+
+
+def _function_arguments(args: ast.arguments) -> list[ast.arg]:
+    """A signature's named parameters (positional, positional-only, keyword-only).
+
+    ``*args`` and ``**kwargs`` are intentionally excluded: no caller here treats
+    a catch-all as a geometry-carrying parameter.
+    """
+
+    return [*args.posonlyargs, *args.args, *args.kwonlyargs]
+
+
 def _all_bound_names(tree: ast.AST) -> set[str]:
     names: set[str] = set()
     for node in ast.walk(tree):
@@ -164,7 +243,7 @@ def _all_bound_names(tree: ast.AST) -> set[str]:
     return names
 
 
-class _LoadNameRewriter(ast.NodeTransformer):
+class _LoadNameRewriter(_KeepNestedScopes):
     """Rewrite reaching definitions while respecting local expression scopes."""
 
     def __init__(self, mapping: Mapping[str, str]) -> None:
@@ -180,15 +259,11 @@ class _LoadNameRewriter(ast.NodeTransformer):
             and node.id in self.mapping
             and not self._is_shadowed(node.id)
         ):
-            return ast.copy_location(
-                ast.Name(id=self.mapping[node.id], ctx=ast.Load()), node
-            )
+            return ast.copy_location(_load(self.mapping[node.id]), node)
         return node
 
     def visit_Lambda(self, node: ast.Lambda) -> ast.AST:
-        bound = {argument.arg for argument in node.args.args}
-        bound.update(argument.arg for argument in node.args.posonlyargs)
-        bound.update(argument.arg for argument in node.args.kwonlyargs)
+        bound = {argument.arg for argument in _function_arguments(node.args)}
         if node.args.vararg:
             bound.add(node.args.vararg.arg)
         if node.args.kwarg:
@@ -224,15 +299,6 @@ class _LoadNameRewriter(ast.NodeTransformer):
     visit_GeneratorExp = _visit_comprehension_expression
     visit_DictComp = _visit_comprehension_expression
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
-        return node
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
-        return node
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
-        return node
-
 
 def _rewrite_loads(node: ast.AST, mapping: Mapping[str, str]) -> ast.AST:
     return _LoadNameRewriter(mapping).visit(node)
@@ -243,7 +309,7 @@ def _rewrite_loads(node: ast.AST, mapping: Mapping[str, str]) -> ast.AST:
 # ---------------------------------------------------------------------------
 
 
-class _NamespaceAttributeRewriter(ast.NodeTransformer):
+class _NamespaceAttributeRewriter(_KeepNestedScopes):
     def __init__(self, mappings: Mapping[str, Mapping[str, str]]) -> None:
         self.mappings = mappings
 
@@ -252,16 +318,7 @@ class _NamespaceAttributeRewriter(ast.NodeTransformer):
         if isinstance(node.value, ast.Name) and isinstance(node.ctx, ast.Load):
             replacement = self.mappings.get(node.value.id, {}).get(node.attr)
             if replacement is not None:
-                return ast.copy_location(ast.Name(id=replacement, ctx=ast.Load()), node)
-        return node
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
-        return node
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
-        return node
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> ast.AST:
+                return ast.copy_location(_load(replacement), node)
         return node
 
 
@@ -340,11 +397,9 @@ def _flatten_simple_namespaces(tree: ast.Module, report: CCForReport) -> ast.Mod
                 if flattened_nested is None:
                     # Preserve the nested constructor as a named value even when
                     # its positional/** form cannot be recursively flattened.
-                    assignment = ast.Assign(
-                        targets=[ast.Name(id=nested_root, ctx=ast.Store())],
-                        value=keyword.value,
+                    emitted.append(
+                        _assign(nested_root, keyword.value, location)
                     )
-                    emitted.append(ast.copy_location(assignment, location))
                 else:
                     nested_statements, nested_reconstruction = flattened_nested
                     emitted.extend(nested_statements)
@@ -361,33 +416,28 @@ def _flatten_simple_namespaces(tree: ast.Module, report: CCForReport) -> ast.Mod
                 flattened = allocate(
                     root, keyword.arg, force_prefix=nested
                 )
-                assignment = ast.Assign(
-                    targets=[ast.Name(id=flattened, ctx=ast.Store())],
-                    value=keyword.value,
-                )
-                emitted.append(ast.copy_location(assignment, location))
+                emitted.append(_assign(flattened, keyword.value, location))
             key_map[keyword.arg] = flattened
 
         mappings[root] = key_map
         report.flattened_namespaces[root] = dict(key_map)
-        reconstruction = ast.Assign(
-            targets=[ast.Name(id=root, ctx=ast.Store())],
-            value=ast.Call(
+        reconstruction = _assign(
+            root,
+            ast.Call(
                 func=copy.deepcopy(call.func),
                 args=[],
                 keywords=[
                     ast.keyword(
                         arg=keyword.arg,
-                        value=ast.Name(
-                            id=key_map[keyword.arg], ctx=ast.Load()
-                        ),
+                        value=_load(key_map[keyword.arg]),
                     )
                     for keyword in call.keywords
                     if keyword.arg is not None
                 ],
             ),
+            location,
         )
-        return emitted, ast.copy_location(reconstruction, location)
+        return emitted, reconstruction
 
     new_body: list[ast.stmt] = []
     for stmt in tree.body:
@@ -754,7 +804,7 @@ def _remove_dead_none_from_block(
 # ---------------------------------------------------------------------------
 
 
-class _DefinitionCounter(ast.NodeVisitor):
+class _DefinitionCounter(_SkipNestedScopes):
     def __init__(self) -> None:
         self.counts: Counter[str] = Counter()
 
@@ -784,15 +834,6 @@ class _DefinitionCounter(ast.NodeVisitor):
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
         self.visit_For(node)  # type: ignore[arg-type]
 
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        return
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        return
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        return
-
 
 def _loads_before_definition(statements: Sequence[ast.stmt]) -> set[str]:
     seen: set[str] = set()
@@ -807,7 +848,7 @@ def _loads_before_definition(statements: Sequence[ast.stmt]) -> set[str]:
     return before
 
 
-class _ProtectedNameCollector(ast.NodeVisitor):
+class _ProtectedNameCollector(_SkipNestedScopes):
     """Find definitions that cannot be converted to plain lexical SSA."""
 
     def __init__(self) -> None:
@@ -847,15 +888,6 @@ class _ProtectedNameCollector(ast.NodeVisitor):
         for case in node.cases:
             for stmt in case.body:
                 self.visit(stmt)
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        return
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        return
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        return
 
 
 class _SSARenamer:
@@ -1140,7 +1172,7 @@ def _infer_top_level_geometry_names(tree: ast.Module, result_name: str) -> set[s
     return geometry
 
 
-class _ControlFlowMutationCollector(ast.NodeVisitor):
+class _ControlFlowMutationCollector(_SkipNestedScopes):
     def __init__(self) -> None:
         self.mutated: set[str] = set()
         self.depth = 0
@@ -1192,15 +1224,6 @@ class _ControlFlowMutationCollector(ast.NodeVisitor):
         ):
             self.mutated.add(node.value.func.value.id)
         self.generic_visit(node)
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        return
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        return
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        return
 
 
 def _split_module_header(
@@ -1273,46 +1296,55 @@ def _movable_parameter_indices(
     return movable
 
 
-def _hoist_parameter_assignments(
-    tree: ast.Module, report: CCForReport, result_name: str
-) -> ast.Module:
-    """CC-for placement: one contiguous parameter preamble after the imports."""
+@dataclass(frozen=True)
+class _ParameterContext:
+    """The shared input both placements consume.
 
+    CC-for and CC-step run the identical analysis and split the module the same
+    way; they differ only in where the movable parameters end up.  ``movable`` is
+    the ascending list of indices into ``body`` that qualify as parameters.
+    """
+
+    docstrings: list[ast.stmt]
+    imports: list[ast.stmt]
+    body: list[ast.stmt]
+    movable: list[int]
+
+
+def _parameter_context(tree: ast.Module, result_name: str) -> _ParameterContext:
     geometry = _infer_top_level_geometry_names(tree, result_name)
     mutation_collector = _ControlFlowMutationCollector()
     mutation_collector.visit(tree)
 
     constructors, modules = _simple_namespace_aliases(tree)
     docstrings, imports, body = _split_module_header(tree)
-    movable = set(
-        _movable_parameter_indices(
-            body,
-            geometry,
-            mutation_collector.mutated,
-            result_name,
-            constructors,
-            modules,
-            _math_import_names(tree),
-        )
+    movable = _movable_parameter_indices(
+        body,
+        geometry,
+        mutation_collector.mutated,
+        result_name,
+        constructors,
+        modules,
+        _math_import_names(tree),
     )
+    return _ParameterContext(docstrings, imports, body, movable)
 
-    parameters = [body[index] for index in sorted(movable)]
+
+def _hoist_parameter_assignments(
+    tree: ast.Module, report: CCForReport, result_name: str
+) -> ast.Module:
+    """CC-for placement: one contiguous parameter preamble after the imports."""
+
+    context = _parameter_context(tree, result_name)
+    body, movable = context.body, set(context.movable)
+
+    parameters = [stmt for index, stmt in enumerate(body) if index in movable]
     remainder = [stmt for index, stmt in enumerate(body) if index not in movable]
-    report.hoisted_parameters.extend(
-        name
-        for stmt in parameters
-        if (name := _simple_assignment_name(stmt)) is not None
-    )
+    report.hoisted_parameters.extend(_names_of(parameters))
     if parameters:
-        report.parameter_groups.append(
-            [
-                name
-                for stmt in parameters
-                if (name := _simple_assignment_name(stmt)) is not None
-            ]
-        )
+        report.parameter_groups.append(_names_of(parameters))
 
-    tree.body = docstrings + imports + parameters + remainder
+    tree.body = context.docstrings + context.imports + parameters + remainder
     return tree
 
 
@@ -1359,29 +1391,12 @@ def _sink_parameter_assignments(
     once its own dependencies are.
     """
 
-    geometry = _infer_top_level_geometry_names(tree, result_name)
-    mutation_collector = _ControlFlowMutationCollector()
-    mutation_collector.visit(tree)
-
-    constructors, modules = _simple_namespace_aliases(tree)
-    docstrings, imports, body = _split_module_header(tree)
-    candidates = _movable_parameter_indices(
-        body,
-        geometry,
-        mutation_collector.mutated,
-        result_name,
-        constructors,
-        modules,
-        _math_import_names(tree),
-    )
+    context = _parameter_context(tree, result_name)
+    body, candidates = context.body, context.movable
 
     # Repositioning one of several definitions of a name would change which one
     # reaches a use, so a redefined name stays exactly where the source put it.
-    definition_counts = Counter(
-        name
-        for stmt in body
-        if (name := _simple_assignment_name(stmt)) is not None
-    )
+    definition_counts = Counter(_names_of(body))
     movable = [
         index
         for index in candidates
@@ -1509,7 +1524,7 @@ def _sink_parameter_assignments(
     if current:
         report.parameter_groups.append(current)
 
-    tree.body = docstrings + imports + ordered
+    tree.body = context.docstrings + context.imports + ordered
     return tree
 
 
@@ -1676,12 +1691,7 @@ def _geometry_factory_names(tree: ast.AST) -> set[str]:
             for child in ast.walk(node)
         )
         arguments = {
-            argument.arg
-            for argument in (
-                list(node.args.posonlyargs)
-                + list(node.args.args)
-                + list(node.args.kwonlyargs)
-            )
+            argument.arg for argument in _function_arguments(node.args)
         }
         transforms_geometry_argument = bool(
             arguments & _GEOMETRY_PARAMETER_HINTS
@@ -1796,10 +1806,7 @@ class _WorkplaneLowerer:
 
     def _emit_geometry_call(self, call: ast.Call, location: ast.AST) -> tuple[ast.Assign, ast.Name]:
         name = self._new_wp()
-        assignment = ast.Assign(
-            targets=[ast.Name(id=name, ctx=ast.Store())], value=call
-        )
-        return ast.copy_location(assignment, location), ast.Name(id=name, ctx=ast.Load())
+        return _assign(name, call, location), _load(name)
 
     def _lower_expr(
         self,
@@ -1809,12 +1816,10 @@ class _WorkplaneLowerer:
     ) -> tuple[list[ast.stmt], ast.AST, bool]:
         if isinstance(node, ast.Name):
             if isinstance(node.ctx, ast.Load) and node.id in aliases:
-                return [], ast.copy_location(
-                    ast.Name(id=aliases[node.id], ctx=ast.Load()), node
-                ), True
+                return [], ast.copy_location(_load(aliases[node.id]), node), True
             if isinstance(node.ctx, ast.Load) and node.id in dynamic_geometry:
                 return [], ast.copy_location(
-                    ast.Name(id=dynamic_geometry[node.id], ctx=ast.Load()), node
+                    _load(dynamic_geometry[node.id]), node
                 ), True
             return [], node, False
 
@@ -1887,12 +1892,10 @@ class _WorkplaneLowerer:
             key = _state_key(node)
             if isinstance(node.ctx, ast.Load) and key is not None:
                 if key in aliases:
-                    return [], ast.copy_location(
-                        ast.Name(id=aliases[key], ctx=ast.Load()), node
-                    ), True
+                    return [], ast.copy_location(_load(aliases[key]), node), True
                 if key in dynamic_geometry:
                     return [], ast.copy_location(
-                        ast.Name(id=dynamic_geometry[key], ctx=ast.Load()), node
+                        _load(dynamic_geometry[key]), node
                     ), True
             prefix, value, is_geometry = self._lower_expr(
                 node.value, aliases, dynamic_geometry
@@ -1937,26 +1940,16 @@ class _WorkplaneLowerer:
             )
             if body_geometry and else_geometry:
                 wp_name = self._new_wp()
-                body_statements = body_prefix + [
-                    ast.Assign(
-                        targets=[ast.Name(id=wp_name, ctx=ast.Store())],
-                        value=body,
-                    )
-                ]
-                else_statements = else_prefix + [
-                    ast.Assign(
-                        targets=[ast.Name(id=wp_name, ctx=ast.Store())],
-                        value=orelse,
-                    )
-                ]
                 conditional = ast.If(
                     test=test,
-                    body=body_statements,
-                    orelse=else_statements,
+                    body=body_prefix + [_assign(wp_name, body)],
+                    orelse=else_prefix + [_assign(wp_name, orelse)],
                 )
-                return [ast.copy_location(conditional, node)], ast.Name(
-                    id=wp_name, ctx=ast.Load()
-                ), True
+                return (
+                    [ast.copy_location(conditional, node)],
+                    _load(wp_name),
+                    True,
+                )
             # Do not move branch prefixes outside a conditional expression: that
             # would evaluate an originally lazy branch. Unknown mixed-type cases
             # stay intact and can be recognized at their next CadQuery use.
@@ -1991,7 +1984,7 @@ class _WorkplaneLowerer:
                 type_comment=None,
             )
             return [ast.copy_location(helper, node)], ast.copy_location(
-                ast.Name(id=helper_name, ctx=ast.Load()), node
+                _load(helper_name), node
             ), False
 
         if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
@@ -2040,10 +2033,22 @@ class _WorkplaneLowerer:
         stable_name = dynamic.setdefault(name, self._state_name(name))
         if current is None or current == stable_name:
             return None
-        return ast.Assign(
-            targets=[ast.Name(id=stable_name, ctx=ast.Store())],
-            value=ast.Name(id=current, ctx=ast.Load()),
-        )
+        return _assign(stable_name, _load(current))
+
+    def _spill_geometry(
+        self, value: ast.AST, location: ast.AST, output: list[ast.stmt]
+    ) -> ast.Name:
+        """Give a geometry ``value`` a plain ``wpN`` name to alias it by.
+
+        A bare ``Name`` already is one; anything else is emitted as ``wpN =
+        value`` so callers can record the alias against a single name.
+        """
+
+        if isinstance(value, ast.Name):
+            return value
+        wp_name = self._new_wp()
+        output.append(_assign(wp_name, value, location))
+        return _load(wp_name)
 
     def _lower_block(
         self,
@@ -2067,35 +2072,9 @@ class _WorkplaneLowerer:
                 if isinstance(target, ast.Name):
                     name = target.id
                     if is_geometry:
-                        if not isinstance(value, ast.Name):
-                            wp_name = self._new_wp()
-                            output.append(
-                                ast.copy_location(
-                                    ast.Assign(
-                                        targets=[
-                                            ast.Name(
-                                                id=wp_name, ctx=ast.Store()
-                                            )
-                                        ],
-                                        value=value,
-                                    ),
-                                    stmt,
-                                )
-                            )
-                            value = ast.Name(id=wp_name, ctx=ast.Load())
-                        assert isinstance(value, ast.Name)
+                        value = self._spill_geometry(value, stmt, output)
                         if name in dynamic:
-                            output.append(
-                                ast.copy_location(
-                                    ast.Assign(
-                                        targets=[
-                                            ast.Name(id=dynamic[name], ctx=ast.Store())
-                                        ],
-                                        value=value,
-                                    ),
-                                    stmt,
-                                )
-                            )
+                            output.append(_assign(dynamic[name], value, stmt))
                         else:
                             aliases[name] = value.id
                         if tracks_result and name == self.result_name:
@@ -2107,32 +2086,10 @@ class _WorkplaneLowerer:
                         # explicit state name and still suppress all non-terminal
                         # ``result`` definitions.
                         wp_name = self._new_wp()
-                        output.append(
-                            ast.copy_location(
-                                ast.Assign(
-                                    targets=[
-                                        ast.Name(id=wp_name, ctx=ast.Store())
-                                    ],
-                                    value=value,
-                                ),
-                                stmt,
-                            )
-                        )
+                        output.append(_assign(wp_name, value, stmt))
                         if name in dynamic:
                             output.append(
-                                ast.copy_location(
-                                    ast.Assign(
-                                        targets=[
-                                            ast.Name(
-                                                id=dynamic[name], ctx=ast.Store()
-                                            )
-                                        ],
-                                        value=ast.Name(
-                                            id=wp_name, ctx=ast.Load()
-                                        ),
-                                    ),
-                                    stmt,
-                                )
+                                _assign(dynamic[name], _load(wp_name), stmt)
                             )
                         else:
                             aliases[name] = wp_name
@@ -2167,23 +2124,7 @@ class _WorkplaneLowerer:
                     )
                     output.extend(prefix)
                     if isinstance(stmt.target, ast.Name) and is_geometry:
-                        if not isinstance(value, ast.Name):
-                            wp_name = self._new_wp()
-                            output.append(
-                                ast.copy_location(
-                                    ast.Assign(
-                                        targets=[
-                                            ast.Name(
-                                                id=wp_name, ctx=ast.Store()
-                                            )
-                                        ],
-                                        value=value,
-                                    ),
-                                    stmt,
-                                )
-                            )
-                            value = ast.Name(id=wp_name, ctx=ast.Load())
-                        assert isinstance(value, ast.Name)
+                        value = self._spill_geometry(value, stmt, output)
                         aliases[stmt.target.id] = value.id
                         continue
                     stmt.value = value
@@ -2292,35 +2233,11 @@ class _WorkplaneLowerer:
                         aliases.pop(name, None)
                         if body_name != stable_name:
                             stmt.body.append(
-                                ast.copy_location(
-                                    ast.Assign(
-                                        targets=[
-                                            ast.Name(
-                                                id=stable_name, ctx=ast.Store()
-                                            )
-                                        ],
-                                        value=ast.Name(
-                                            id=body_name, ctx=ast.Load()
-                                        ),
-                                    ),
-                                    stmt,
-                                )
+                                _assign(stable_name, _load(body_name), stmt)
                             )
                         if else_name != stable_name:
                             stmt.orelse.append(
-                                ast.copy_location(
-                                    ast.Assign(
-                                        targets=[
-                                            ast.Name(
-                                                id=stable_name, ctx=ast.Store()
-                                            )
-                                        ],
-                                        value=ast.Name(
-                                            id=else_name, ctx=ast.Load()
-                                        ),
-                                    ),
-                                    stmt,
-                                )
+                                _assign(stable_name, _load(else_name), stmt)
                             )
                 output.append(stmt)
                 continue
@@ -2328,11 +2245,7 @@ class _WorkplaneLowerer:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 parameter_aliases = {
                     argument.arg: argument.arg
-                    for argument in (
-                        list(stmt.args.posonlyargs)
-                        + list(stmt.args.args)
-                        + list(stmt.args.kwonlyargs)
-                    )
+                    for argument in _function_arguments(stmt.args)
                     if argument.arg in _GEOMETRY_PARAMETER_HINTS
                 }
                 declares_global_result = any(
@@ -2408,43 +2321,17 @@ class _WorkplaneLowerer:
                 final_name.startswith("wp") and final_name[2:].isdigit()
             ):
                 wp_name = self._new_wp()
-                tree.body.append(
-                    ast.Assign(
-                        targets=[ast.Name(id=wp_name, ctx=ast.Store())],
-                        value=ast.Name(id=final_name, ctx=ast.Load()),
-                    )
-                )
+                tree.body.append(_assign(wp_name, _load(final_name)))
                 final_name = wp_name
-            terminal = ast.Assign(
-                targets=[ast.Name(id=self.result_name, ctx=ast.Store())],
-                value=ast.Name(id=final_name, ctx=ast.Load()),
-            )
-        elif self.result_name in dynamic:
-            wp_name = self._new_wp()
-            tree.body.append(
-                ast.Assign(
-                    targets=[ast.Name(id=wp_name, ctx=ast.Store())],
-                    value=ast.Name(id=dynamic[self.result_name], ctx=ast.Load()),
-                )
-            )
-            terminal = ast.Assign(
-                targets=[ast.Name(id=self.result_name, ctx=ast.Store())],
-                value=ast.Name(id=wp_name, ctx=ast.Load()),
-            )
-        elif self.global_result_state is not None:
-            wp_name = self._new_wp()
-            tree.body.append(
-                ast.Assign(
-                    targets=[ast.Name(id=wp_name, ctx=ast.Store())],
-                    value=ast.Name(
-                        id=self.global_result_state, ctx=ast.Load()
-                    ),
-                )
-            )
-            terminal = ast.Assign(
-                targets=[ast.Name(id=self.result_name, ctx=ast.Store())],
-                value=ast.Name(id=wp_name, ctx=ast.Load()),
-            )
+            terminal = _assign(self.result_name, _load(final_name))
+        else:
+            # Loop-carried or ``global`` result state is held under a stable name
+            # rather than a ``wpN`` alias; give the terminal its own ``wpN`` step.
+            state = dynamic.get(self.result_name) or self.global_result_state
+            if state is not None:
+                wp_name = self._new_wp()
+                tree.body.append(_assign(wp_name, _load(state)))
+                terminal = _assign(self.result_name, _load(wp_name))
         if terminal is not None:
             tree.body.append(terminal)
         elif not self.saw_result:
