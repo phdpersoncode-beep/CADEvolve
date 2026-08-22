@@ -64,22 +64,31 @@ def _evaluate(path: Path, **kwargs):
     return evaluate_program(path.read_text(encoding="utf-8"), name=path.stem, **kwargs)
 
 
+@pytest.mark.parametrize("placement", ("preamble", "late"))
 @pytest.mark.parametrize("path", CASE_PATHS, ids=CASE_IDS)
-def test_edge_case_structural_gates(path: Path) -> None:
-    """Conversion, contract, parameters, loops and literals -- no CAD needed."""
+def test_edge_case_structural_gates(path: Path, placement: str) -> None:
+    """Conversion, contract, parameters, loops and literals -- no CAD needed.
 
-    evaluation = _evaluate(path, run_geometry=False)
+    Run for both representations: CC-for and CC-step share every stage except
+    parameter placement, so a defect in one is expected in the other, and a gate
+    that only holds for one of them is a placement bug.
+    """
+
+    evaluation = _evaluate(path, run_geometry=False, parameter_placement=placement)
     expected = KNOWN_FAILURES.get(path.stem, {})
     for gate in evaluation.gates:
         if gate.skipped or gate.name == "idempotent":
             continue
         if gate.name in expected:
             assert not gate.passed, (
-                f"{path.stem}: gate {gate.name!r} now passes -- remove it from "
-                f"KNOWN_FAILURES ({expected[gate.name]})"
+                f"{path.stem} [{placement}]: gate {gate.name!r} now passes -- "
+                f"remove it from KNOWN_FAILURES ({expected[gate.name]})"
             )
             continue
-        assert gate.passed, f"{path.stem}: {gate.name} failed: {gate.error or gate.detail}"
+        assert gate.passed, (
+            f"{path.stem} [{placement}]: {gate.name} failed: "
+            f"{gate.error or gate.detail}"
+        )
 
 
 @pytest.mark.skipif(not HAS_CADQUERY, reason="CadQuery is required for geometry gates")
@@ -98,17 +107,23 @@ def test_edge_case_geometry_gates(path: Path) -> None:
 
 
 @pytest.mark.skipif(not HAS_CADQUERY, reason="CadQuery is required for geometry gates")
+@pytest.mark.parametrize("placement", ("preamble", "late"))
 @pytest.mark.parametrize(
     "path",
     sorted(ZERO_TO_CAD_FIXTURES.glob("*.py")),
     ids=lambda path: path.stem,
 )
-def test_zero_to_cad_fixtures_round_trip(path: Path) -> None:
-    evaluation = _evaluate(path, run_perturbations=False)
+def test_zero_to_cad_fixtures_round_trip(path: Path, placement: str) -> None:
+    evaluation = _evaluate(
+        path, run_perturbations=False, parameter_placement=placement
+    )
     for gate in evaluation.gates:
         if gate.skipped or gate.name == "idempotent":
             continue
-        assert gate.passed, f"{path.stem}: {gate.name} failed: {gate.error or gate.detail}"
+        assert gate.passed, (
+            f"{path.stem} [{placement}]: {gate.name} failed: "
+            f"{gate.error or gate.detail}"
+        )
 
 
 @pytest.mark.xfail(
@@ -171,6 +186,36 @@ def test_augmented_assignment_regression_is_still_open() -> None:
     assert "total += 2.0" in canonical, "AugAssign target was left unversioned"
     with pytest.raises(NameError):
         exec(compile(canonical, "<canonical>", "exec"), {}, {})
+
+
+def test_late_layout_gate_flags_a_parameter_that_could_sink() -> None:
+    """Guard the CC-step gate itself: it has to be able to fail.
+
+    This is CC-step output with one parameter dragged back above the step before
+    the one that reads it, which is exactly the defect the gate exists to catch.
+    """
+
+    canonical = """
+import cadquery as cq
+plate = 40.0
+hole = 4.0
+wp1 = cq.Workplane('XY')
+wp2 = wp1.box(plate, plate, 6.0)
+depth = 2.0
+wp3 = wp2.faces('>Z')
+wp4 = wp3.hole(hole, depth)
+result = wp4
+"""
+    layout = code_metrics.late_parameter_layout(canonical)
+    assert not layout.grouped
+    assert layout.early_parameters == ("hole",)
+
+    moved = canonical.replace("hole = 4.0\n", "").replace(
+        "depth = 2.0", "hole = 4.0\ndepth = 2.0"
+    )
+    fixed = code_metrics.late_parameter_layout(moved)
+    assert fixed.grouped, fixed.early_parameters
+    assert fixed.group_count == 2
 
 
 def test_preamble_gate_ignores_docstrings_and_loop_carried_state() -> None:

@@ -558,6 +558,14 @@ def late_parameter_layout(
     Anything else was defined earlier than it had to be.  A parameter that is
     pinned by control flow, or that nothing reads at all, has no later anchor to
     move to and is reported rather than counted against the layout.
+
+    This is a necessary condition, not a sufficient one.  Lowering erases the
+    source statement boundaries -- every step reads the step before it, so a
+    fluent chain and two consecutive features look alike -- which means a
+    program whose parameters were never split at all presents as one group in
+    which everything is legitimately justified.  ``group_count`` is reported so
+    that case is visible, and the corpus-level check that placement actually
+    splits the preamble lives in ``tests/test_cc_step.py``.
     """
 
     tree = ast.parse(code)

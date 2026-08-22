@@ -1,0 +1,350 @@
+"""CC-step: the CC-for converter with each parameter group placed at its step.
+
+These tests cover the placement itself -- which statements move, where they land,
+and that moving them cannot change what the program builds.  The gates shared
+with CC-for live in ``test_cc_for.py`` and ``test_cc_for_eval_suite.py``.
+"""
+
+from __future__ import annotations
+
+import ast
+import importlib.util
+import unittest
+from pathlib import Path
+
+from dataset_utils.utils.canonicalization.cc_for import (
+    CCForConfig,
+    canonicalize_code,
+    decompose_actions,
+    validate_structure,
+)
+from dataset_utils.utils.canonicalization.cc_for_validation import (
+    validate_prefixes,
+    validate_round_trip,
+)
+from evals.cc_for.code_metrics import late_parameter_layout, parameter_groups
+
+FIXTURES = Path(__file__).parent / "fixtures" / "zero_to_cad"
+CADEVOLVE_FIXTURES = Path(__file__).parent / "fixtures" / "cadevolve_p"
+CASES = Path(__file__).parents[1] / "evals" / "cc_for" / "cases"
+HAS_CADQUERY = importlib.util.find_spec("cadquery") is not None
+
+# Programs whose CC-for conversion is already known to be wrong; CC-step inherits
+# the defect because it shares every stage but parameter placement.  See
+# tests/test_cc_for_eval_suite.py for the analysis of each.
+KNOWN_BAD_CONVERSIONS = {
+    "augmented_assignment_offsets",
+    "result_read_before_alias",
+    "self_attribute_rebuild",
+}
+
+
+def convert(source: str, placement: str = "late"):
+    return canonicalize_code(source, CCForConfig(parameter_placement=placement))
+
+
+def top_level_names(code: str) -> list[str]:
+    """Names assigned by top-level simple assignments, in emitted order."""
+
+    names: list[str] = []
+    for stmt in ast.parse(code).body:
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+        ):
+            names.append(stmt.targets[0].id)
+    return names
+
+
+class LatePlacementTests(unittest.TestCase):
+    def test_each_parameter_group_precedes_the_step_that_uses_it(self) -> None:
+        source = """
+import cadquery as cq
+length = 80
+width = 30
+height = 10
+hole_diameter = 5
+base = cq.Workplane('XY').box(length, width, height)
+result = base.faces('>Z').workplane().hole(hole_diameter)
+"""
+        converted = convert(source)
+        names = top_level_names(converted.code)
+        # The box dimensions introduce the first step; the hole diameter is not
+        # read until the second, so it must not appear before the first wp line.
+        self.assertLess(names.index("height"), names.index("wp1"))
+        self.assertGreater(names.index("hole_diameter"), names.index("wp1"))
+        self.assertEqual(
+            converted.report.parameter_groups,
+            [["length", "width", "height"], ["hole_diameter"]],
+        )
+
+    def test_cc_for_keeps_one_preamble_for_the_same_program(self) -> None:
+        source = """
+import cadquery as cq
+length = 80
+width = 30
+height = 10
+hole_diameter = 5
+base = cq.Workplane('XY').box(length, width, height)
+result = base.faces('>Z').workplane().hole(hole_diameter)
+"""
+        names = top_level_names(convert(source, "preamble").code)
+        self.assertLess(names.index("hole_diameter"), names.index("wp1"))
+
+    def test_derived_parameters_travel_with_the_value_they_feed(self) -> None:
+        source = """
+import cadquery as cq
+plate = 40
+margin = 4
+inset = plate / 2 - margin
+body = cq.Workplane('XY').box(plate, plate, 5)
+result = body.faces('>Z').workplane().rect(inset, inset).cutBlind(-2)
+"""
+        names = top_level_names(convert(source).code)
+        # margin is only read by inset, so it belongs to inset's group.
+        for name in ("margin", "inset"):
+            self.assertGreater(names.index(name), names.index("wp1"), name)
+        self.assertLess(names.index("margin"), names.index("inset"))
+
+    def test_parameter_read_inside_a_helper_stays_above_its_definition(self) -> None:
+        source = """
+import cadquery as cq
+hub_radius = 9.0
+
+def blade(width):
+    return cq.Workplane('XY').box(width, hub_radius, 2.0)
+blade_width = 3.0
+result = blade(blade_width)
+"""
+        converted = convert(source)
+        body = ast.parse(converted.code).body
+        names = [
+            stmt.name if isinstance(stmt, ast.FunctionDef) else None for stmt in body
+        ]
+        definition = names.index("blade")
+        assigned = top_level_names(converted.code)
+        # A function body's reads are invisible to a scoped analysis; sinking
+        # hub_radius past the def would leave it unbound when blade() runs.
+        self.assertIn("hub_radius", assigned)
+        self.assertLess(
+            [
+                index
+                for index, stmt in enumerate(body)
+                if isinstance(stmt, ast.Assign)
+                and isinstance(stmt.targets[0], ast.Name)
+                and stmt.targets[0].id == "hub_radius"
+            ][0],
+            definition,
+        )
+
+    def test_loop_parameters_group_above_the_loop(self) -> None:
+        source = """
+import cadquery as cq
+count = 4
+pitch = 6.0
+stud = 1.5
+base = cq.Workplane('XY').box(40, 10, 4)
+points = []
+for i in range(count):
+    points.append((i * pitch - 9.0, 0))
+result = base.faces('>Z').workplane().pushPoints(points).hole(stud)
+"""
+        names = top_level_names(convert(source).code)
+        self.assertGreater(names.index("count"), names.index("wp1"))
+        self.assertGreater(names.index("stud"), names.index("points"))
+
+    def test_a_redefined_name_is_never_repositioned(self) -> None:
+        source = """
+import cadquery as cq
+size = 10
+part = cq.Workplane('XY').box(size, size, size)
+size = 4
+result = part.faces('>Z').workplane().hole(size)
+"""
+        converted = canonicalize_code(
+            source,
+            CCForConfig(parameter_placement="late", version_reassignments=False),
+        )
+        names = top_level_names(converted.code)
+        # Both definitions of `size` keep their source position relative to the
+        # steps between them, or the second would reach the first step's box().
+        self.assertEqual([name for name in names if name == "size"], ["size", "size"])
+        self.assertLess(names.index("size"), names.index("wp1"))
+
+    def test_structure_contract_holds(self) -> None:
+        for fixture in sorted(FIXTURES.glob("*.py")):
+            with self.subTest(fixture=fixture.name):
+                converted = convert(fixture.read_text(encoding="utf-8"))
+                self.assertEqual(converted.report.structural_errors, [])
+                self.assertEqual(validate_structure(converted.code), [])
+
+    def test_no_parameter_could_sink_further(self) -> None:
+        sources = sorted(FIXTURES.glob("*.py")) + sorted(CASES.glob("*.py"))
+        for fixture in sources:
+            with self.subTest(fixture=fixture.name):
+                converted = convert(fixture.read_text(encoding="utf-8"))
+                layout = late_parameter_layout(
+                    converted.code,
+                    exempt=frozenset(converted.report.loop_carried_names),
+                )
+                self.assertEqual(layout.early_parameters, ())
+
+    def test_placement_actually_splits_the_preamble(self) -> None:
+        """CC-step has to differ from CC-for, not merely be allowed to."""
+
+        split = 0
+        for fixture in sorted(FIXTURES.glob("*.py")):
+            source = fixture.read_text(encoding="utf-8")
+            late = late_parameter_layout(convert(source).code)
+            if late.group_count > 1:
+                split += 1
+            self.assertGreaterEqual(late.group_count, 1, fixture.name)
+        self.assertGreaterEqual(split, 8, "late placement barely moved anything")
+
+    def test_late_placement_moves_a_subset_of_what_cc_for_hoists(self) -> None:
+        """The extra refusals are exactly the names defined more than once.
+
+        Hoisting every definition of a repeated name into one preamble leaves
+        their relative order intact, so CC-for gets away with it.  Sinking them
+        to different steps would not, so CC-step leaves them where they are.
+        """
+
+        for fixture in sorted(FIXTURES.glob("*.py")) + sorted(CASES.glob("*.py")):
+            with self.subTest(fixture=fixture.name):
+                source = fixture.read_text(encoding="utf-8")
+                hoisted = set(convert(source, "preamble").report.hoisted_parameters)
+                late = convert(source, "late")
+                sunk = set(late.report.hoisted_parameters)
+                self.assertLessEqual(sunk, hoisted)
+
+                counts: dict[str, int] = {}
+                for stmt in ast.parse(late.code).body:
+                    if (
+                        isinstance(stmt, ast.Assign)
+                        and len(stmt.targets) == 1
+                        and isinstance(stmt.targets[0], ast.Name)
+                    ):
+                        name = stmt.targets[0].id
+                        counts[name] = counts.get(name, 0) + 1
+                for name in hoisted - sunk:
+                    self.assertGreater(counts.get(name, 0), 1, name)
+
+    def test_actions_carry_their_parameter_group(self) -> None:
+        source = """
+import cadquery as cq
+length = 80
+width = 30
+height = 10
+hole_diameter = 5
+base = cq.Workplane('XY').box(length, width, height)
+result = base.faces('>Z').workplane().hole(hole_diameter)
+"""
+        converted = convert(source)
+        actions = decompose_actions(converted.code, parameter_placement="late")
+        self.assertEqual(actions[0].kind, "preamble")
+        self.assertEqual(actions[0].code, "import cadquery as cq")
+        self.assertIn("length = 80", actions[1].code)
+        self.assertIn("wp1 = cq.Workplane('XY')", actions[1].code)
+        self.assertTrue(
+            any("hole_diameter = 5" in action.code for action in actions[2:])
+        )
+        # Every action still runs as a prefix of the ones before it.
+        self.assertEqual(
+            "\n".join(action.code for action in actions).strip(),
+            converted.code.strip(),
+        )
+
+
+@unittest.skipUnless(HAS_CADQUERY, "CadQuery is required for geometry validation")
+class LatePlacementGeometryTests(unittest.TestCase):
+    def test_round_trip_and_prefixes_on_zero_to_cad_examples(self) -> None:
+        for fixture in sorted(FIXTURES.glob("*.py")):
+            source = fixture.read_text(encoding="utf-8")
+            with self.subTest(fixture=fixture.name):
+                converted = convert(source)
+                round_trip = validate_round_trip(source, converted.code)
+                self.assertTrue(round_trip.success, round_trip.to_dict())
+                prefixes = validate_prefixes(
+                    converted.code, parameter_placement="late"
+                )
+                self.assertTrue(prefixes.success, prefixes.to_dict())
+
+    def test_round_trip_on_cadevolve_p_examples(self) -> None:
+        for fixture in sorted(CADEVOLVE_FIXTURES.glob("*.py")):
+            source = fixture.read_text(encoding="utf-8")
+            with self.subTest(fixture=fixture.name):
+                converted = convert(source)
+                round_trip = validate_round_trip(source, converted.code)
+                self.assertTrue(round_trip.success, round_trip.to_dict())
+
+    def test_edge_cases_build_the_source_solid(self) -> None:
+        for fixture in sorted(CASES.glob("*.py")):
+            if fixture.stem in KNOWN_BAD_CONVERSIONS:
+                continue
+            source = fixture.read_text(encoding="utf-8")
+            with self.subTest(fixture=fixture.name):
+                round_trip = validate_round_trip(source, convert(source).code)
+                self.assertTrue(round_trip.success, round_trip.to_dict())
+
+    def test_known_bad_conversions_are_no_worse_than_cc_for(self) -> None:
+        """A CC-for defect must not be reported as a CC-step regression."""
+
+        for name in sorted(KNOWN_BAD_CONVERSIONS):
+            source = (CASES / f"{name}.py").read_text(encoding="utf-8")
+            with self.subTest(fixture=name):
+                self.assertFalse(
+                    validate_round_trip(source, convert(source, "preamble").code).success,
+                    f"{name} now converts under CC-for; drop it from "
+                    "KNOWN_BAD_CONVERSIONS",
+                )
+                self.assertFalse(
+                    validate_round_trip(source, convert(source, "late").code).success
+                )
+
+
+@unittest.skipUnless(HAS_CADQUERY, "CadQuery is required for geometry comparison")
+class RepresentationAgreementTests(unittest.TestCase):
+    """CADEvolve-C, CC-for and CC-step must describe the same solid."""
+
+    def test_zero_to_cad_fixtures_agree_across_representations(self) -> None:
+        from evals.cc_for.representations import compare_representations
+
+        for fixture in sorted(FIXTURES.glob("*.py")):
+            with self.subTest(fixture=fixture.name):
+                evaluation = compare_representations(
+                    fixture.read_text(encoding="utf-8"),
+                    name=fixture.stem,
+                    require_cadevolve_c=True,
+                )
+                for build in evaluation.builds:
+                    self.assertTrue(build.built, f"{build.name}: {build.error}")
+                for comparison in evaluation.comparisons:
+                    self.assertTrue(
+                        comparison.passed,
+                        f"{comparison.left} vs {comparison.right}: "
+                        f"{comparison.mismatches} {comparison.scores}",
+                    )
+                self.assertTrue(evaluation.passed)
+
+
+class ParameterGroupTests(unittest.TestCase):
+    def test_groups_partition_every_top_level_statement(self) -> None:
+        code = convert(
+            (FIXTURES / "patterned_plate.py").read_text(encoding="utf-8")
+        ).code
+        groups = parameter_groups(code)
+        counted = sum(
+            len(parameters) + len(statements) for parameters, statements in groups
+        )
+        body = ast.parse(code).body
+        imports = sum(
+            1
+            for stmt in body
+            if isinstance(stmt, (ast.Import, ast.ImportFrom))
+        )
+        self.assertEqual(counted, len(body) - imports)
+
+
+if __name__ == "__main__":
+    unittest.main()
