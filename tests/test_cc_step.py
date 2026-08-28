@@ -250,33 +250,114 @@ result = plate.faces('>Z').workplane().circle(reach / 8).cutThruAll()
             self.assertGreaterEqual(late.group_count, 1, fixture.name)
         self.assertGreaterEqual(split, 8, "late placement barely moved anything")
 
-    def test_late_placement_moves_a_subset_of_what_cc_for_hoists(self) -> None:
-        """The extra refusals are exactly the names defined more than once.
+    def test_both_placements_move_exactly_the_same_parameters(self) -> None:
+        """One predicate classifies parameters; only the destination differs.
 
-        Hoisting every definition of a repeated name into one preamble leaves
-        their relative order intact, so CC-for gets away with it.  Sinking them
-        to different steps would not, so CC-step leaves them where they are.
+        A name a second statement also binds is not a parameter for either of
+        them -- CC-for would hoist it above that binding and CC-step would sink
+        it below -- so the two lists are equal rather than merely nested.
         """
 
         for fixture in sorted(FIXTURES.glob("*.py")) + sorted(CASES.glob("*.py")):
             with self.subTest(fixture=fixture.name):
                 source = fixture.read_text(encoding="utf-8")
                 hoisted = set(convert(source, "preamble").report.hoisted_parameters)
-                late = convert(source, "late")
-                sunk = set(late.report.hoisted_parameters)
-                self.assertLessEqual(sunk, hoisted)
+                sunk = set(convert(source, "late").report.hoisted_parameters)
+                self.assertEqual(sunk, hoisted)
 
-                counts: dict[str, int] = {}
-                for stmt in ast.parse(late.code).body:
-                    if (
-                        isinstance(stmt, ast.Assign)
-                        and len(stmt.targets) == 1
+    def test_a_conditionally_rebound_accumulator_never_moves(self) -> None:
+        """Neither placement may carry an initializer across its own loop.
+
+        Nothing in the loop *reads* ``tallest``, so the loop does not look like a
+        reader and sinking would put the initializer below it, overwriting what
+        the loop computed.  Running the same program with the reset after the
+        loop pins the other direction, which is the one that catches hoisting.
+        """
+
+        sunk_below = """
+import cadquery as cq
+plate = 40.0
+thickness = 4.0
+heights = [1.0, 6.0, 2.0]
+threshold = 3.0
+part = cq.Workplane('XY').box(plate, plate, thickness)
+tallest = 0.5
+for height in heights:
+    if height > threshold:
+        tallest = height
+result = part.faces('>Z').workplane().circle(6.0).extrude(tallest)
+"""
+        hoisted_above = """
+import cadquery as cq
+plate = 40.0
+thickness = 4.0
+heights = [1.0, 6.0, 2.0]
+threshold = 3.0
+part = cq.Workplane('XY').box(plate, plate, thickness)
+for height in heights:
+    if height > threshold:
+        tallest = height
+tallest = 0.5
+result = part.faces('>Z').workplane().circle(6.0).extrude(tallest)
+"""
+        for label, source in (("sunk", sunk_below), ("hoisted", hoisted_above)):
+            for placement in ("preamble", "late"):
+                with self.subTest(case=label, placement=placement):
+                    converted = convert(source, placement)
+                    self.assertNotIn(
+                        "tallest", converted.report.hoisted_parameters
+                    )
+                    body = ast.parse(converted.code).body
+                    loop = next(
+                        index
+                        for index, stmt in enumerate(body)
+                        if isinstance(stmt, ast.For)
+                    )
+                    initializer = next(
+                        index
+                        for index, stmt in enumerate(body)
+                        if isinstance(stmt, ast.Assign)
                         and isinstance(stmt.targets[0], ast.Name)
-                    ):
-                        name = stmt.targets[0].id
-                        counts[name] = counts.get(name, 0) + 1
-                for name in hoisted - sunk:
-                    self.assertGreater(counts.get(name, 0), 1, name)
+                        and stmt.targets[0].id == "tallest"
+                        and isinstance(stmt.value, ast.Constant)
+                    )
+                    if label == "sunk":
+                        self.assertLess(initializer, loop)
+                    else:
+                        self.assertGreater(initializer, loop)
+
+    def test_a_parameter_sinks_past_a_loop_that_does_not_read_it(self) -> None:
+        """The refusal above is about rebinding, not about loops in general."""
+
+        source = """
+import cadquery as cq
+bar_len = 70.0
+bar_wid = 18.0
+bar_thk = 6.0
+groove_count = 3
+notch_count = 2
+notch_depth = 1.5
+bar = cq.Workplane('XY').box(bar_len, bar_wid, bar_thk)
+for groove in range(groove_count):
+    bar = bar.faces('>Z').workplane().center(groove * 14.0 - 14.0, 0).rect(3.0, bar_wid).cutBlind(-1.0)
+for notch in range(notch_count):
+    bar = bar.faces('>Z').workplane().center(notch * 20.0 - 10.0, 0).circle(2.0).cutBlind(-notch_depth)
+result = bar
+"""
+        body = ast.parse(convert(source).code).body
+        loops = [
+            index for index, stmt in enumerate(body) if isinstance(stmt, ast.For)
+        ]
+        depth = next(
+            index
+            for index, stmt in enumerate(body)
+            if isinstance(stmt, ast.Assign)
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == "notch_depth"
+        )
+        self.assertEqual(len(loops), 2)
+        self.assertGreater(depth, loops[0])
+        self.assertLess(depth, loops[1])
 
     def test_actions_carry_their_parameter_group(self) -> None:
         source = """

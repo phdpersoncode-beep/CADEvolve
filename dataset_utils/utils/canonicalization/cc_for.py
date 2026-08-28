@@ -1249,6 +1249,30 @@ def _split_module_header(
     return docstrings, imports, body
 
 
+def _rebound_names(body: Sequence[ast.stmt]) -> set[str]:
+    """Names more than one top-level statement binds, so no parameter may cross.
+
+    Reaching-definition renaming versions the ordinary case, but a name a loop or
+    a branch also writes has to keep one stable binding, so both definitions
+    survive into this stage.  Moving the plain one is then unsound in either
+    direction: CC-for would hoist an accumulator's initializer above the loop that
+    updates it, and CC-step would sink it below, and both read a value the source
+    never produced.  Excluding it here rules out both, and anything derived from
+    it follows through the ``loads & local_defs <= movable_names`` test.
+
+    A ``global`` declaration counts as a binding: the module-level name is
+    reachable from a call this analysis cannot see into.
+    """
+
+    counts: Counter[str] = Counter()
+    for stmt in body:
+        counts.update(_assigned_names(stmt))
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Global):
+                counts.update(node.names)
+    return {name for name, count in counts.items() if count > 1}
+
+
 def _movable_parameter_indices(
     body: Sequence[ast.stmt],
     geometry: set[str],
@@ -1262,10 +1286,11 @@ def _movable_parameter_indices(
 
     A statement qualifies when it binds one name to a pure data expression that
     reads no geometry, no control-flow-mutated state, and no name that itself had
-    to stay put.  The namespace object flattening rebuilds from the parameters it
-    just exposed counts too: it holds nothing but those keywords, so it travels
-    with them.  Both placement strategies classify from this one predicate, so
-    CC-for and CC-step always treat the same statements as parameters.
+    to stay put, and when nothing else in the module binds the name it defines.
+    The namespace object flattening rebuilds from the parameters it just exposed
+    counts too: it holds nothing but those keywords, so it travels with them.
+    Both placement strategies classify from this one predicate, so CC-for and
+    CC-step always treat the same statements as parameters.
     """
 
     constructors = constructors or set()
@@ -1275,12 +1300,15 @@ def _movable_parameter_indices(
         for stmt in body
         if (name := _simple_assignment_name(stmt)) is not None
     }
+    rebound = _rebound_names(body)
     movable_names: set[str] = set()
     movable: list[int] = []
     for index, stmt in enumerate(body):
         name = _simple_assignment_name(stmt)
         value = _assignment_value(stmt)
         if name is None or value is None or name == result_name or name in geometry:
+            continue
+        if name in rebound:
             continue
         loads = _loaded_names(value)
         is_data = _is_pure_data_expression(
@@ -1392,16 +1420,7 @@ def _sink_parameter_assignments(
     """
 
     context = _parameter_context(tree, result_name)
-    body, candidates = context.body, context.movable
-
-    # Repositioning one of several definitions of a name would change which one
-    # reaches a use, so a redefined name stays exactly where the source put it.
-    definition_counts = Counter(_names_of(body))
-    movable = [
-        index
-        for index in candidates
-        if definition_counts[_simple_assignment_name(body[index])] == 1
-    ]
+    body, movable = context.body, context.movable
     movable_set = set(movable)
     name_of = {index: _simple_assignment_name(body[index]) for index in movable}
 

@@ -57,7 +57,7 @@ A statement is a *movable parameter* when it binds one name to a value that
 reads no geometry, no control-flow-mutated state, and no name that itself had to
 stay put. Both placements classify from this one predicate, so the two
 representations can only differ in where a parameter goes, never in which
-statements count as parameters. Three cases are worth naming:
+statements count as parameters. Four cases are worth naming:
 
 - **Namespace reconstruction.** Flattening a `SimpleNamespace` leaves a
   compatibility object that rebuilds the namespace from the fields it just
