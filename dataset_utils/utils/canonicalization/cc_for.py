@@ -19,6 +19,7 @@ from typing import Any, Iterable, Literal, Mapping, MutableMapping, Sequence
 
 
 LoopMode = Literal["preserve", "unroll"]
+ParameterPlacement = Literal["preamble", "late"]
 
 
 @dataclass(frozen=True)
@@ -33,10 +34,15 @@ class CCForConfig:
     hoist_parameters: bool = True
     explicit_workplanes: bool = True
     result_name: str = "result"
+    parameter_placement: ParameterPlacement = "preamble"
 
     def __post_init__(self) -> None:
         if self.loop_mode not in {"preserve", "unroll"}:
             raise ValueError(f"Unsupported loop mode: {self.loop_mode!r}")
+        if self.parameter_placement not in {"preamble", "late"}:
+            raise ValueError(
+                f"Unsupported parameter placement: {self.parameter_placement!r}"
+            )
         if self.max_unroll_iterations < 1:
             raise ValueError("max_unroll_iterations must be positive")
 
@@ -46,6 +52,7 @@ class CCForReport:
     """Machine-readable record of transformations and deliberate exceptions."""
 
     loop_mode: LoopMode
+    parameter_placement: ParameterPlacement = "preamble"
     flattened_namespaces: dict[str, dict[str, str]] = field(default_factory=dict)
     unrolled_loops: int = 0
     preserved_loops: int = 0
@@ -53,6 +60,7 @@ class CCForReport:
     versioned_names: dict[str, list[str]] = field(default_factory=dict)
     loop_carried_names: list[str] = field(default_factory=list)
     hoisted_parameters: list[str] = field(default_factory=list)
+    parameter_groups: list[list[str]] = field(default_factory=list)
     workplane_steps: int = 0
     structural_errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -1014,9 +1022,29 @@ _SAFE_DATA_CALLS = {
 _SAFE_CQ_DATA_CALLS = {"Location", "Plane", "Vector"}
 
 
+def _math_import_names(tree: ast.AST) -> set[str]:
+    """Names bound by ``from math import cos, radians, ...``.
+
+    Calling one of these is parameter algebra, not modelling.  Without this a
+    program that writes ``radians(angle)`` instead of ``math.radians(angle)``
+    looks like it starts building geometry at its first derived angle, and every
+    parameter behind that angle is stuck where the source happened to put it.
+    """
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in {"math", "numpy"}:
+            for alias in node.names:
+                names.add(alias.asname or alias.name)
+    return names
+
+
 class _PureDataExpression(ast.NodeVisitor):
-    def __init__(self, geometry_names: set[str]) -> None:
+    def __init__(
+        self, geometry_names: set[str], safe_calls: set[str] | None = None
+    ) -> None:
         self.geometry_names = geometry_names
+        self.safe_calls = _SAFE_DATA_CALLS | (safe_calls or set())
         self.pure = True
 
     def visit_Name(self, node: ast.Name) -> None:
@@ -1026,7 +1054,7 @@ class _PureDataExpression(ast.NodeVisitor):
     def visit_Call(self, node: ast.Call) -> None:
         allowed = False
         if isinstance(node.func, ast.Name):
-            allowed = node.func.id in _SAFE_DATA_CALLS
+            allowed = node.func.id in self.safe_calls
         elif isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
             if node.func.value.id == "math":
                 allowed = True
@@ -1041,8 +1069,10 @@ class _PureDataExpression(ast.NodeVisitor):
         return
 
 
-def _is_pure_data_expression(node: ast.AST, geometry_names: set[str]) -> bool:
-    visitor = _PureDataExpression(geometry_names)
+def _is_pure_data_expression(
+    node: ast.AST, geometry_names: set[str], safe_calls: set[str] | None = None
+) -> bool:
+    visitor = _PureDataExpression(geometry_names, safe_calls)
     visitor.visit(node)
     return visitor.pure
 
@@ -1173,15 +1203,13 @@ class _ControlFlowMutationCollector(ast.NodeVisitor):
         return
 
 
-def _hoist_parameter_assignments(
-    tree: ast.Module, report: CCForReport, result_name: str
-) -> ast.Module:
-    geometry = _infer_top_level_geometry_names(tree, result_name)
-    mutation_collector = _ControlFlowMutationCollector()
-    mutation_collector.visit(tree)
+def _split_module_header(
+    tree: ast.Module,
+) -> tuple[list[ast.stmt], list[ast.stmt], list[ast.stmt]]:
+    """Separate the module docstring and imports from the statements that move."""
 
-    imports: list[ast.stmt] = []
     docstrings: list[ast.stmt] = []
+    imports: list[ast.stmt] = []
     body: list[ast.stmt] = []
     for index, stmt in enumerate(tree.body):
         if (
@@ -1195,39 +1223,293 @@ def _hoist_parameter_assignments(
             imports.append(stmt)
         else:
             body.append(stmt)
+    return docstrings, imports, body
 
+
+def _movable_parameter_indices(
+    body: Sequence[ast.stmt],
+    geometry: set[str],
+    mutated: set[str],
+    result_name: str,
+    constructors: set[str] | None = None,
+    modules: set[str] | None = None,
+    safe_calls: set[str] | None = None,
+) -> list[int]:
+    """Indices of the statements that may be repositioned as named parameters.
+
+    A statement qualifies when it binds one name to a pure data expression that
+    reads no geometry, no control-flow-mutated state, and no name that itself had
+    to stay put.  The namespace object flattening rebuilds from the parameters it
+    just exposed counts too: it holds nothing but those keywords, so it travels
+    with them.  Both placement strategies classify from this one predicate, so
+    CC-for and CC-step always treat the same statements as parameters.
+    """
+
+    constructors = constructors or set()
+    modules = modules or set()
     local_defs = {
         name
         for stmt in body
-        for name in ([ _simple_assignment_name(stmt) ] if _simple_assignment_name(stmt) else [])
+        if (name := _simple_assignment_name(stmt)) is not None
     }
-    hoisted_names: set[str] = set()
-    parameters: list[ast.stmt] = []
-    remainder: list[ast.stmt] = []
-
-    for stmt in body:
+    movable_names: set[str] = set()
+    movable: list[int] = []
+    for index, stmt in enumerate(body):
         name = _simple_assignment_name(stmt)
         value = _assignment_value(stmt)
         if name is None or value is None or name == result_name or name in geometry:
-            remainder.append(stmt)
             continue
-
         loads = _loaded_names(value)
-        local_dependencies = loads & local_defs
-        dependencies_ready = local_dependencies <= hoisted_names
-        is_hoistable = (
-            dependencies_ready
-            and not (loads & mutation_collector.mutated)
-            and _is_pure_data_expression(value, geometry)
+        is_data = _is_pure_data_expression(
+            value, geometry, safe_calls
+        ) or _is_namespace_call(value, constructors, modules)
+        if (
+            loads & local_defs <= movable_names
+            and not (loads & mutated)
+            and is_data
+        ):
+            movable.append(index)
+            movable_names.add(name)
+    return movable
+
+
+def _hoist_parameter_assignments(
+    tree: ast.Module, report: CCForReport, result_name: str
+) -> ast.Module:
+    """CC-for placement: one contiguous parameter preamble after the imports."""
+
+    geometry = _infer_top_level_geometry_names(tree, result_name)
+    mutation_collector = _ControlFlowMutationCollector()
+    mutation_collector.visit(tree)
+
+    constructors, modules = _simple_namespace_aliases(tree)
+    docstrings, imports, body = _split_module_header(tree)
+    movable = set(
+        _movable_parameter_indices(
+            body,
+            geometry,
+            mutation_collector.mutated,
+            result_name,
+            constructors,
+            modules,
+            _math_import_names(tree),
         )
-        if is_hoistable:
-            parameters.append(stmt)
-            hoisted_names.add(name)
-            report.hoisted_parameters.append(name)
-        else:
-            remainder.append(stmt)
+    )
+
+    parameters = [body[index] for index in sorted(movable)]
+    remainder = [stmt for index, stmt in enumerate(body) if index not in movable]
+    report.hoisted_parameters.extend(
+        name
+        for stmt in parameters
+        if (name := _simple_assignment_name(stmt)) is not None
+    )
+    if parameters:
+        report.parameter_groups.append(
+            [
+                name
+                for stmt in parameters
+                if (name := _simple_assignment_name(stmt)) is not None
+            ]
+        )
 
     tree.body = docstrings + imports + parameters + remainder
+    return tree
+
+
+def _deep_loaded_names(node: ast.AST) -> set[str]:
+    """Every ``Load`` name below ``node``, including nested function scopes.
+
+    Reader detection has to be conservative: missing a read would let a parameter
+    sink past the statement that needs it.  Descending into ``def`` bodies and
+    lambdas can only pull an anchor earlier, which is always safe.
+    """
+
+    return {
+        child.id
+        for child in ast.walk(node)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+    }
+
+
+def _defines_before_use(statements: Sequence[ast.stmt], tracked: set[str]) -> bool:
+    """True when every tracked name is bound before the statement that reads it.
+
+    Module-level binding order is the question, so this reads scoped names: a
+    ``def`` or ``class`` body resolves its own locals at call time and a parameter
+    that merely shares a name with a module-level one is not a read of it.
+    """
+
+    bound: set[str] = set()
+    for stmt in statements:
+        if (_loaded_names(stmt) & tracked) - bound:
+            return False
+        bound |= _assigned_names(stmt)
+    return True
+
+
+def _sink_parameter_assignments(
+    tree: ast.Module, report: CCForReport, result_name: str
+) -> ast.Module:
+    """CC-step placement: each parameter group sits above the step that uses it.
+
+    Every movable parameter is anchored to the earliest top-level statement that
+    reads it, resolving reads through other parameters so a chain such as
+    ``a -> b -> box(b)`` lands as a unit.  Parameters sharing an anchor keep their
+    source order, which is dependency order because a parameter is only movable
+    once its own dependencies are.
+    """
+
+    geometry = _infer_top_level_geometry_names(tree, result_name)
+    mutation_collector = _ControlFlowMutationCollector()
+    mutation_collector.visit(tree)
+
+    constructors, modules = _simple_namespace_aliases(tree)
+    docstrings, imports, body = _split_module_header(tree)
+    candidates = _movable_parameter_indices(
+        body,
+        geometry,
+        mutation_collector.mutated,
+        result_name,
+        constructors,
+        modules,
+        _math_import_names(tree),
+    )
+
+    # Repositioning one of several definitions of a name would change which one
+    # reaches a use, so a redefined name stays exactly where the source put it.
+    definition_counts = Counter(
+        name
+        for stmt in body
+        if (name := _simple_assignment_name(stmt)) is not None
+    )
+    movable = [
+        index
+        for index in candidates
+        if definition_counts[_simple_assignment_name(body[index])] == 1
+    ]
+    movable_set = set(movable)
+    name_of = {index: _simple_assignment_name(body[index]) for index in movable}
+
+    reads = [_deep_loaded_names(stmt) for stmt in body]
+    fixed = [index for index in range(len(body)) if index not in movable_set]
+
+    def _fallback(index: int) -> int | None:
+        """Where a parameter with nothing to anchor to goes: the next step."""
+
+        following = [anchor for anchor in fixed if anchor > index]
+        if following:
+            return following[0]
+        return fixed[-1] if fixed else None
+
+    def _readers(index: int) -> list[int]:
+        name = name_of[index]
+        return [
+            reader
+            for reader in range(index + 1, len(body))
+            if name in reads[reader]
+        ]
+
+    def _dependencies(index: int) -> list[int]:
+        return [
+            other
+            for other in movable
+            if other < index and name_of[other] in reads[index]
+        ]
+
+    # The latest legal position for a parameter is the first modelling statement
+    # that reads it, or -- when only other parameters read it -- the position
+    # those parameters were themselves pushed to.  Descending order works because
+    # a read always follows the definition it reads.
+    anchors: dict[int, int | None] = {}
+    for index in sorted(movable, reverse=True):
+        bounds = [
+            anchors[reader] if reader in movable_set else reader
+            for reader in _readers(index)
+            if reader not in movable_set or anchors.get(reader) is not None
+        ]
+        anchors[index] = min(bounds) if bounds else None
+
+    # What is left is unread: nothing in the program constrains where it goes.
+    # Flattening leaves exactly one of these behind -- the namespace
+    # compatibility object -- and pinning it to the first step would pin every
+    # field it names along with it.  Settle these against each other instead,
+    # taking the last position their dependencies reached, or failing that the
+    # first position a reader reached.  Each round can only fill in a position
+    # that is still open, so the loop runs at most once per parameter.
+    unresolved = [index for index in movable if anchors[index] is None]
+    while unresolved:
+        progressed = []
+        for index in unresolved:
+            settled = [
+                anchors[other]
+                for other in _dependencies(index)
+                if anchors.get(other) is not None
+            ]
+            if settled:
+                anchors[index] = max(settled)
+            else:
+                reader_anchors = [
+                    anchors[reader]
+                    for reader in _readers(index)
+                    if reader in movable_set and anchors.get(reader) is not None
+                ]
+                anchors[index] = min(reader_anchors) if reader_anchors else None
+            if anchors[index] is None:
+                progressed.append(index)
+        if len(progressed) == len(unresolved):
+            break
+        unresolved = progressed
+    for index in unresolved:
+        anchors[index] = _fallback(index)
+
+    def _emit(placement: Mapping[int, int | None]) -> list[ast.stmt]:
+        grouped: dict[int, list[ast.stmt]] = defaultdict(list)
+        trailing: list[ast.stmt] = []
+        for index in movable:
+            anchor = placement[index]
+            if anchor is None:
+                trailing.append(body[index])
+            else:
+                grouped[anchor].append(body[index])
+
+        emitted: list[ast.stmt] = []
+        for index, stmt in enumerate(body):
+            if index in movable_set:
+                continue
+            emitted.extend(grouped.get(index, ()))
+            emitted.append(stmt)
+        emitted.extend(trailing)
+        return emitted
+
+    ordered = _emit(anchors)
+    if not _defines_before_use(ordered, set(name_of.values())):
+        # An escape hatch, not a second strategy: send every parameter to the
+        # step that follows it in the source instead.  That order is valid by
+        # construction -- a dependency precedes its reader in the source, so it
+        # reaches the same step or an earlier one, and within a step the source
+        # order is kept -- so it always recovers a program Python accepts, at the
+        # cost of sinking nothing.
+        report.warnings.append(
+            "Kept parameters in source position: sinking them would have read a "
+            "name before it is bound"
+        )
+        anchors = {index: _fallback(index) for index in movable}
+        ordered = _emit(anchors)
+
+    report.hoisted_parameters.extend(name_of[index] for index in movable)
+    moved = set(name_of.values())
+    current: list[str] = []
+    for stmt in ordered:
+        name = _simple_assignment_name(stmt)
+        if name is not None and name in moved:
+            current.append(name)
+        elif current:
+            report.parameter_groups.append(current)
+            current = []
+    if current:
+        report.parameter_groups.append(current)
+
+    tree.body = docstrings + imports + ordered
     return tree
 
 
@@ -2242,7 +2524,9 @@ def canonicalize_code(
     """Convert one top-level CadQuery script into the CC-for representation."""
 
     config = config or CCForConfig()
-    report = CCForReport(loop_mode=config.loop_mode)
+    report = CCForReport(
+        loop_mode=config.loop_mode, parameter_placement=config.parameter_placement
+    )
     tree = ast.parse(source)
     compile(tree, "<source>", "exec")
 
@@ -2261,7 +2545,10 @@ def canonicalize_code(
         tree = _SSARenamer(tree, report, config.result_name).transform(tree)
 
     if config.hoist_parameters:
-        tree = _hoist_parameter_assignments(tree, report, config.result_name)
+        if config.parameter_placement == "late":
+            tree = _sink_parameter_assignments(tree, report, config.result_name)
+        else:
+            tree = _hoist_parameter_assignments(tree, report, config.result_name)
 
     if config.explicit_workplanes:
         tree = _WorkplaneLowerer(tree, report, config.result_name).transform(tree)
@@ -2272,10 +2559,11 @@ def canonicalize_code(
     return CanonicalizationResult(code=code, report=report)
 
 
-def decompose_actions(code: str, result_name: str = "result") -> list[CanonicalAction]:
-    """Split CC-for code into the Step-ToCAD top-level action representation."""
+def _decompose_preamble_actions(
+    tree: ast.Module, result_name: str
+) -> tuple[list[ast.stmt], list[ast.stmt]]:
+    """CC-for split: imports and the leading parameter block form one action."""
 
-    tree = ast.parse(code)
     preamble: list[ast.stmt] = []
     statements: list[ast.stmt] = []
     seen_modeling = False
@@ -2294,25 +2582,93 @@ def decompose_actions(code: str, result_name: str = "result") -> list[CanonicalA
             continue
         seen_modeling = True
         statements.append(stmt)
+    return preamble, statements
+
+
+def _decompose_late_actions(
+    tree: ast.Module, result_name: str
+) -> tuple[list[ast.stmt], list[list[ast.stmt]]]:
+    """CC-step split: every parameter group joins the step it was placed for.
+
+    Only the docstring and imports stay in the header; a parameter that sits
+    above a modelling statement is part of that step's action, which is the whole
+    point of placing it there.
+    """
+
+    geometry = _infer_top_level_geometry_names(tree, result_name)
+    header: list[ast.stmt] = []
+    groups: list[list[ast.stmt]] = []
+    pending: list[ast.stmt] = []
+    seen_modeling = False
+
+    for index, stmt in enumerate(tree.body):
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)) or (
+            index == 0
+            and isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and isinstance(stmt.value.value, str)
+        ):
+            if not seen_modeling:
+                header.append(stmt)
+                continue
+
+        name = _simple_assignment_name(stmt)
+        value = _assignment_value(stmt)
+        is_parameter = (
+            name is not None
+            and value is not None
+            and name != result_name
+            and name not in geometry
+            and not _expression_uses_geometry(value, geometry)
+        )
+        if is_parameter:
+            pending.append(stmt)
+            continue
+
+        seen_modeling = True
+        groups.append([*pending, stmt])
+        pending = []
+
+    if pending:
+        if groups:
+            groups[-1].extend(pending)
+        else:
+            header.extend(pending)
+    return header, groups
+
+
+def decompose_actions(
+    code: str,
+    result_name: str = "result",
+    parameter_placement: ParameterPlacement = "preamble",
+) -> list[CanonicalAction]:
+    """Split canonical code into the Step-ToCAD top-level action representation."""
+
+    tree = ast.parse(code)
+    if parameter_placement == "late":
+        header, groups = _decompose_late_actions(tree, result_name)
+    else:
+        header, statements = _decompose_preamble_actions(tree, result_name)
+        groups = [[stmt] for stmt in statements]
 
     actions: list[CanonicalAction] = []
-    if preamble:
+    if header:
         actions.append(
             CanonicalAction(
                 kind="preamble",
-                code=ast.unparse(ast.Module(body=preamble, type_ignores=[])),
+                code=ast.unparse(ast.Module(body=header, type_ignores=[])),
             )
         )
 
-    for stmt in statements:
-        stmt_code = ast.unparse(stmt)
-        if _is_terminal_assignment(stmt, result_name) and actions:
+    for group in groups:
+        group_code = ast.unparse(ast.Module(body=group, type_ignores=[]))
+        if len(group) == 1 and _is_terminal_assignment(group[0], result_name) and actions:
             previous = actions[-1]
             actions[-1] = CanonicalAction(
-                kind=previous.kind, code=f"{previous.code}\n{stmt_code}"
+                kind=previous.kind, code=f"{previous.code}\n{group_code}"
             )
         else:
-            actions.append(CanonicalAction(kind="statement", code=stmt_code))
+            actions.append(CanonicalAction(kind="statement", code=group_code))
     return actions
 
 
@@ -2321,6 +2677,8 @@ __all__ = [
     "CCForReport",
     "CanonicalAction",
     "CanonicalizationResult",
+    "LoopMode",
+    "ParameterPlacement",
     "canonicalize_code",
     "decompose_actions",
     "validate_structure",

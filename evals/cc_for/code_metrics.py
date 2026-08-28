@@ -344,6 +344,45 @@ def control_flow_bound_names(code: str) -> set[str]:
     return names
 
 
+def _is_header_statement(stmt: ast.stmt) -> bool:
+    """Imports and the module docstring precede any parameter block."""
+
+    if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+        return True
+    return (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Constant)
+        and isinstance(stmt.value.value, str)
+    )
+
+
+def _is_geometry_statement(
+    stmt: ast.stmt,
+    containers: frozenset[str] | set[str],
+    result_name: str,
+) -> bool:
+    if _is_header_statement(stmt):
+        return False
+    if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+        target = stmt.targets[0]
+        if isinstance(target, ast.Name) and (
+            _WORKPLANE_NAME.match(target.id) or target.id == result_name
+        ):
+            return True
+        return not _is_pure_data(stmt.value, containers)
+    return True  # loops, defs, classes, expressions: modelling territory
+
+
+def _deep_loads(node: ast.AST) -> set[str]:
+    """Every ``Load`` name below ``node``, function and lambda bodies included."""
+
+    return {
+        child.id
+        for child in ast.walk(node)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+    }
+
+
 def preamble_layout(
     code: str,
     result_name: str = "result",
@@ -361,27 +400,10 @@ def preamble_layout(
     exempt = set(exempt) | control_flow_bound_names(code) | container_roots(code)
 
     def is_header(stmt: ast.stmt) -> bool:
-        """Imports and the module docstring precede the parameter block."""
-
-        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-            return True
-        return (
-            isinstance(stmt, ast.Expr)
-            and isinstance(stmt.value, ast.Constant)
-            and isinstance(stmt.value.value, str)
-        )
+        return _is_header_statement(stmt)
 
     def is_geometry_statement(stmt: ast.stmt) -> bool:
-        if is_header(stmt):
-            return False
-        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
-            target = stmt.targets[0]
-            if isinstance(target, ast.Name) and (
-                _WORKPLANE_NAME.match(target.id) or target.id == result_name
-            ):
-                return True
-            return not _is_pure_data(stmt.value, containers)
-        return True  # loops, defs, classes, expressions: modelling territory
+        return _is_geometry_statement(stmt, containers, result_name)
 
     imports = 0
     for stmt in body:
@@ -460,6 +482,176 @@ def preamble_layout(
     )
 
 
+@dataclass(frozen=True)
+class ParameterGroup:
+    """One run of parameter assignments and the modelling step it introduces."""
+
+    parameters: tuple[str, ...]
+    step_size: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class LateParameterLayout:
+    """Whether every parameter sits directly above the step that consumes it."""
+
+    parameter_count: int
+    group_count: int
+    first_group_size: int
+    largest_group: int
+    grouped: bool
+    early_parameters: tuple[str, ...] = ()
+    unread_parameters: tuple[str, ...] = ()
+    groups: tuple[dict[str, Any], ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def parameter_groups(
+    code: str, result_name: str = "result"
+) -> list[tuple[list[ast.stmt], list[ast.stmt]]]:
+    """Split top-level code into ``(parameters, modelling statements)`` groups.
+
+    A group ends where the next parameter assignment begins, so the modelling
+    statements of a group are exactly the ones its parameters were placed for.
+    """
+
+    tree = ast.parse(code)
+    containers = namespace_aliases(tree) | math_imports(tree)
+    groups: list[tuple[list[ast.stmt], list[ast.stmt]]] = []
+    pending: list[ast.stmt] = []
+    seen_modelling = False
+
+    for stmt in tree.body:
+        if _is_header_statement(stmt) and not seen_modelling and not pending:
+            continue
+        if _is_geometry_statement(stmt, containers, result_name):
+            seen_modelling = True
+            if pending or not groups:
+                groups.append((pending, [stmt]))
+                pending = []
+            else:
+                groups[-1][1].append(stmt)
+        else:
+            pending.append(stmt)
+
+    if pending:
+        if groups:
+            groups[-1][0].extend(pending)
+        else:
+            groups.append((pending, []))
+    return groups
+
+
+def late_parameter_layout(
+    code: str,
+    result_name: str = "result",
+    exempt: frozenset[str] | set[str] = frozenset(),
+) -> LateParameterLayout:
+    """Check that no parameter could have been pushed into a later group.
+
+    A parameter is justified where it stands when the modelling statements of its
+    own group read it, or when another justified parameter of the same group does.
+    Anything else was defined earlier than it had to be.  A parameter that is
+    pinned by control flow, or that nothing reads at all, has no later anchor to
+    move to and is reported rather than counted against the layout.
+
+    This is a necessary condition, not a sufficient one.  Lowering erases the
+    source statement boundaries -- every step reads the step before it, so a
+    fluent chain and two consecutive features look alike -- which means a
+    program whose parameters were never split at all presents as one group in
+    which everything is legitimately justified.  ``group_count`` is reported so
+    that case is visible, and the corpus-level check that placement actually
+    splits the preamble lives in ``tests/test_cc_step.py``.
+    """
+
+    tree = ast.parse(code)
+    containers = namespace_aliases(tree) | math_imports(tree)
+    pinned = set(exempt) | control_flow_bound_names(code) | container_roots(code)
+
+    groups = parameter_groups(code, result_name)
+    all_reads: dict[str, int] = {}
+    for stmt in tree.body:
+        for name in _deep_loads(stmt):
+            all_reads[name] = all_reads.get(name, 0) + 1
+
+    early: list[str] = []
+    unread: list[str] = []
+    records: list[ParameterGroup] = []
+    sizes: list[int] = []
+
+    for parameters, statements in groups:
+        names = [
+            name
+            for stmt in parameters
+            if (name := _assignment_target(stmt)) is not None
+        ]
+        sizes.append(len(names))
+        records.append(ParameterGroup(tuple(names), len(statements)))
+
+        # A parameter settles in this group when the group's own statements read
+        # it, when control flow pins it here, or when nothing reads it at all and
+        # so no later group could claim it.  A statement that binds no simple
+        # name -- an attribute write such as ``measures.width = width`` -- has
+        # nothing to reposition and is settled by construction.  Whatever a
+        # settled statement reads is needed here too, which is how a chain of
+        # derived values, a field write, and the retained namespace container all
+        # keep their inputs in their own group.
+        def _settled(stmt: ast.stmt) -> bool:
+            name = _assignment_target(stmt)
+            if name is None:
+                return True
+            return name in justified or name in pinned or not all_reads.get(name)
+
+        justified: set[str] = set()
+        for stmt in statements:
+            justified |= _deep_loads(stmt)
+        changed = True
+        while changed:
+            changed = False
+            for stmt in parameters:
+                if not _settled(stmt):
+                    continue
+                for read in _deep_loads(stmt):
+                    if read not in justified:
+                        justified.add(read)
+                        changed = True
+
+        for name in names:
+            if name in justified or name in pinned:
+                continue
+            if not all_reads.get(name):
+                unread.append(name)
+                continue
+            early.append(name)
+
+    return LateParameterLayout(
+        parameter_count=sum(sizes),
+        group_count=sum(1 for size in sizes if size),
+        first_group_size=sizes[0] if sizes else 0,
+        largest_group=max(sizes, default=0),
+        grouped=not early,
+        early_parameters=tuple(early),
+        unread_parameters=tuple(unread),
+        groups=tuple(record.to_dict() for record in records),
+    )
+
+
+def _assignment_target(stmt: ast.stmt) -> str | None:
+    if (
+        isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+    ):
+        return stmt.targets[0].id
+    if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+        return stmt.target.id
+    return None
+
+
 def container_roots(code: str) -> set[str]:
     """Names bound to a parameter container, plus aliases of one.
 
@@ -504,6 +696,30 @@ def preamble_names(code: str, result_name: str = "result") -> set[str]:
                         names.add(leaf.id)
         elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
             names.add(stmt.target.id)
+    return names
+
+
+def parameter_block_names(
+    code: str,
+    result_name: str = "result",
+    parameter_placement: str = "preamble",
+) -> set[str]:
+    """Names bound in the canonical parameter blocks, wherever they were placed.
+
+    Under CC-for that is the single preamble; under CC-step it is the union of
+    the per-step groups.  Design-parameter coverage asks whether a dimension is
+    still bound by name, which is the same question either way.
+    """
+
+    if parameter_placement != "late":
+        return preamble_names(code, result_name)
+
+    names: set[str] = set()
+    for parameters, _statements in parameter_groups(code, result_name):
+        for stmt in parameters:
+            name = _assignment_target(stmt)
+            if name is not None:
+                names.add(name)
     return names
 
 
@@ -639,7 +855,9 @@ class CodeComparison:
     numeric_literals_removed: list[float] = field(default_factory=list)
     string_literals_added: list[str] = field(default_factory=list)
     string_literals_removed: list[str] = field(default_factory=list)
+    parameter_placement: str = "preamble"
     preamble: dict[str, Any] = field(default_factory=dict)
+    late_layout: dict[str, Any] = field(default_factory=dict)
 
     @property
     def parameter_retention(self) -> float:
@@ -649,7 +867,7 @@ class CodeComparison:
 
     @property
     def preamble_coverage(self) -> float:
-        """Share of numeric design parameters bound by name in the preamble."""
+        """Share of numeric design parameters still bound by name in a block."""
 
         if self.design_parameters == 0:
             return 1.0
@@ -675,6 +893,7 @@ def compare_code(
     *,
     report: Mapping[str, Any] | None = None,
     result_name: str = "result",
+    parameter_placement: str = "preamble",
 ) -> CodeComparison:
     report = report or {}
     parameters = source_parameters(source, result_name)
@@ -723,7 +942,9 @@ def compare_code(
     ]
 
     numeric_design = design_parameters(source, result_name)
-    canonical_preamble = preamble_names(canonical, result_name)
+    canonical_preamble = parameter_block_names(
+        canonical, result_name, parameter_placement
+    )
     hoisted: set[str] = set()
     unhoisted: list[str] = []
     for parameter in sorted(numeric_design):
@@ -763,9 +984,17 @@ def compare_code(
         numeric_literals_removed=_multiset_difference(source_numbers, canonical_numbers),
         string_literals_added=_multiset_difference(canonical_strings, source_strings),
         string_literals_removed=_multiset_difference(source_strings, canonical_strings),
+        parameter_placement=parameter_placement,
         preamble=preamble_layout(
             canonical,
             result_name,
             exempt=frozenset(report.get("loop_carried_names", ()) or ()),
         ).to_dict(),
+        late_layout=late_parameter_layout(
+            canonical,
+            result_name,
+            exempt=frozenset(report.get("loop_carried_names", ()) or ()),
+        ).to_dict()
+        if parameter_placement == "late"
+        else {},
     )

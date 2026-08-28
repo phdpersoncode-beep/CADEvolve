@@ -1,8 +1,14 @@
 # CC-for evaluation suite
 
-An independent check on the CC-for canonicalizer
+An independent check on the canonicalizer
 (`dataset_utils/utils/canonicalization/cc_for.py`): does the canonical program
 mean the same thing as the source, and does it still *say* it symbolically?
+
+The converter emits two representations that differ only in where the named
+parameters go — CC-for puts them in one preamble after the imports, CC-step puts
+each group directly above the step that reads it — and every gate here runs
+against both. Select one with `--parameter-placement`; see
+[`docs/cc_step_canonicalization.md`](../../docs/cc_step_canonicalization.md).
 
 The suite is deliberately not built on
 `dataset_utils/utils/canonicalization/cc_for_validation.py`. Metrics written
@@ -20,7 +26,8 @@ the **canonical** code, and the **solids** both produce.
 | `structure` | One terminal `result`, no unlowered fluent modelling chains. |
 | `idempotent` | Is canonical output a fixed point? `f(f(x)) == f(x)`. |
 | `parameters_preserved` | Does every source parameter survive, un-inlined? |
-| `parameters_hoisted` | Do parameters form one contiguous preamble after imports? |
+| `parameters_hoisted` | *(`--parameter-placement preamble`)* Do parameters form one contiguous preamble after imports? |
+| `parameters_placed_late` | *(`--parameter-placement late`)* Could any parameter have been pushed into a later group? |
 | `loops_preserved` | Same number of `for` loops in preserve mode. |
 | `literals_stable` | No numeric or string literal invented or dropped. |
 | `chains_lowered` | Every modelling call is its own `wpN` assignment. |
@@ -39,9 +46,15 @@ range of behaviour:
 - **`parameter_retention`** — share of source parameters still named in the
   canonical program, allowing for SSA versioning and namespace flattening.
 - **`preamble_coverage`** — share of a program's *numeric design parameters*
-  bound by name in the canonical preamble. This is the claim the change exists
-  for: a dimension buried as a literal inside a constructor call is not editable
-  downstream, even though the program still builds correctly.
+  bound by name in a canonical parameter block. This is the claim the change
+  exists for: a dimension buried as a literal inside a constructor call is not
+  editable downstream, even though the program still builds correctly. The
+  question is the same under either placement; only where the block sits differs.
+- **`parameter_groups`** — how many groups CC-step split the preamble into.
+  Reported under `--parameter-placement late` only. One group is a legitimate
+  outcome for a program with a single feature, which is why it is reported
+  rather than gated; see the note on what the layout gate cannot see in
+  [`docs/cc_step_canonicalization.md`](../../docs/cc_step_canonicalization.md).
 
 ## Attribution
 
@@ -94,12 +107,30 @@ PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval --corpus path/to/dir
 # baseline a known open defect so the verdict reflects everything else
 PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval \
     --corpus demo --no-geometry --ignore-gate idempotent --fail-under 0.99
+
+# the same gates against CC-step instead of CC-for
+PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval \
+    --corpus fixtures --parameter-placement late
+```
+
+Do CADEvolve-C, CC-for and CC-step actually describe the same part? That is a
+separate runner, because it compares the representations against each other
+rather than scoring one against its source:
+
+```bash
+PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_representations \
+    --corpus fixtures --report /tmp/representations.json
+
+# symbolic representations only; skips the tracer subprocess entirely
+PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_representations \
+    --corpus demo --limit 200 --skip-cadevolve-c
 ```
 
 As pytest assertions:
 
 ```bash
 PYTHONPATH=.:dataset_utils python -m pytest tests/test_cc_for_eval_suite.py -q
+PYTHONPATH=.:dataset_utils python -m pytest tests/test_cc_step.py -q
 ```
 
 ### Useful flags
@@ -113,6 +144,7 @@ PYTHONPATH=.:dataset_utils python -m pytest tests/test_cc_for_eval_suite.py -q
 | `--voxel-resolution`, `--surface-points` | Similarity cost/precision. |
 | `--ignore-gate NAME` | Stop a gate deciding the verdict while it keeps running and reporting. A defect affecting every program (`idempotent` does today) otherwise turns the verdict column into a wall of red that hides what a change actually moved. Repeatable. |
 | `--fail-under` | Exit non-zero below this pass rate, for CI. |
+| `--parameter-placement` | `preamble` evaluates CC-for, `late` evaluates CC-step. Selects which layout gate decides the verdict. |
 
 ## Modules
 
@@ -120,9 +152,11 @@ PYTHONPATH=.:dataset_utils python -m pytest tests/test_cc_for_eval_suite.py -q
 |---|---|
 | `geometry.py` | Topology, mass properties, face/edge type histograms. Unwraps *every* body on the stack — `Workplane.val()` returns only the first solid, so comparing it cannot see a dropped body. |
 | `similarity.py` | Mesh-based voxel IoU and surface Chamfer after independent centre/longest-extent normalization. |
-| `code_metrics.py` | Parameter retention, preamble coverage and contiguity, loop counts, literal drift, chain depth. |
+| `code_metrics.py` | Parameter retention, block coverage, preamble contiguity and CC-step group layout, loop counts, literal drift, chain depth. |
 | `harness.py` | Runs all gates for one program; never raises for a program-level problem. |
+| `representations.py` | Builds a program as source, CADEvolve-C, CC-for and CC-step, then compares the solids pairwise. Runs the legacy tracer in a subprocess: it monkeypatches CadQuery while recording. |
 | `run_eval.py` | Process-isolated corpus runner with per-batch pools and timeouts. |
+| `run_representations.py` | The same runner shape for the four-way comparison. |
 | `cases/` | Hand-written CadQuery edge cases; each docstring states what it stresses. |
 
 ### On the voxeliser

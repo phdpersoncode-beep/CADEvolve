@@ -5,6 +5,7 @@ flat: false
 
 n_workers: 1
 loop_mode: preserve
+parameter_placement: preamble
 max_unroll_iterations: 64
 
 validate_execution: true

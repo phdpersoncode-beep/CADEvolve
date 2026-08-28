@@ -1,4 +1,10 @@
-"""Batch entry point for symbol-preserving CC-for canonicalization."""
+"""Batch entry point for symbol-preserving CC-for and CC-step canonicalization.
+
+Both representations come out of the same converter and differ only in where the
+named parameters go: ``parameter_placement: preamble`` produces CC-for, one
+parameter block after the imports, and ``parameter_placement: late`` produces
+CC-step, a parameter group directly above each modelling step.
+"""
 
 from __future__ import annotations
 
@@ -8,7 +14,7 @@ import os
 import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +36,7 @@ class PipelineConfig:
     flat: bool = False
     n_workers: int = 1
     loop_mode: str = "preserve"
+    parameter_placement: str = "preamble"
     max_unroll_iterations: int = 64
     validate_execution: bool = True
     validate_prefix_execution: bool = True
@@ -47,6 +54,7 @@ def load_config(path: Path) -> PipelineConfig:
         flat=bool(raw.get("flat", False)),
         n_workers=max(1, int(raw.get("n_workers", 1))),
         loop_mode=str(raw.get("loop_mode", "preserve")),
+        parameter_placement=str(raw.get("parameter_placement", "preamble")),
         max_unroll_iterations=int(raw.get("max_unroll_iterations", 64)),
         validate_execution=bool(raw.get("validate_execution", True)),
         validate_prefix_execution=bool(
@@ -101,6 +109,7 @@ def _process_one(source_string: str, config_data: dict[str, Any]) -> dict[str, A
             original,
             CCForConfig(
                 loop_mode=config.loop_mode,  # type: ignore[arg-type]
+                parameter_placement=config.parameter_placement,  # type: ignore[arg-type]
                 max_unroll_iterations=config.max_unroll_iterations,
             ),
         )
@@ -113,7 +122,9 @@ def _process_one(source_string: str, config_data: dict[str, Any]) -> dict[str, A
             success = success and round_trip.success
 
         if config.validate_prefix_execution:
-            prefixes = validate_prefixes(conversion.code)
+            prefixes = validate_prefixes(
+                conversion.code, parameter_placement=config.parameter_placement
+            )
             record["prefixes"] = prefixes.to_dict()
             success = success and prefixes.success
 
@@ -199,11 +210,21 @@ def run_pipeline(config: PipelineConfig) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Convert sampled CADEvolve-P or Zero-to-CAD scripts to CC-for"
+        description="Convert sampled CADEvolve-P or Zero-to-CAD scripts to "
+        "CC-for or CC-step"
     )
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument(
+        "--parameter-placement",
+        choices=("preamble", "late"),
+        default=None,
+        help="override the config: 'preamble' emits CC-for, 'late' emits CC-step",
+    )
     args = parser.parse_args()
-    summary = run_pipeline(load_config(args.config))
+    config = load_config(args.config)
+    if args.parameter_placement:
+        config = replace(config, parameter_placement=args.parameter_placement)
+    summary = run_pipeline(config)
     print(json.dumps(summary, indent=2, sort_keys=True))
 
 

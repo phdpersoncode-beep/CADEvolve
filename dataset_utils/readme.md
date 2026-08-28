@@ -60,6 +60,24 @@ The converter intentionally preserves source coordinates and scale. Unit-aware
 centering/scaling is a separate stage; running the legacy tracer or scalar rewriter
 after CC-for would destroy parameters or incorrectly scale counts and angles.
 
+### CC-step: parameters at their step
+
+`parameter_placement` selects where the named parameters go. The default
+`preamble` collects them into one block after the imports (CC-for); `late` puts
+each group directly above the modelling step that reads it (CC-step), so a step
+arrives with the dimensions it needs. Everything else — loops, named parameters,
+one assignment per CadQuery call — is identical, and both build the same solid.
+
+```bash
+cd results
+PYTHONPATH=.. python ../canonicalization_run/cc_for_pipeline.py \
+  --config ../canonicalization_run/cfg_cc_step.yaml
+```
+
+`--parameter-placement late` overrides a config for a one-off run. The
+representation contract, the placement rule and measured results are in
+[`docs/cc_step_canonicalization.md`](../docs/cc_step_canonicalization.md).
+
 ### Zero-to-CAD 100K validation
 
 The Hugging Face stress runner reads only the `uuid` and `cadquery_file` Parquet
@@ -125,4 +143,14 @@ and [`docs/cc_for_eval_suite.md`](../docs/cc_for_eval_suite.md) for results.
 ```bash
 PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval --corpus cases
 PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval --corpus demo --no-geometry
+PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval --corpus cases \
+  --parameter-placement late
+```
+
+`evals/cc_for/run_representations.py` answers a different question: do
+CADEvolve-C, CC-for and CC-step describe the same part? It builds all three plus
+the source, executes each, and compares the solids pairwise.
+
+```bash
+PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_representations --corpus fixtures
 ```
