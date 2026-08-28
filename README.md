@@ -80,6 +80,11 @@ with the parameter preamble broken up: each parameter group sits directly above 
 modelling step that reads it, so a step arrives with the dimensions it needs. Select
 it with `parameter_placement: late` in the config, or `--parameter-placement late`.
 
+Either representation decomposes into the Step-ToCAD action sequence with
+`decompose_actions`, and `join_actions` puts that sequence back together as the
+canonical program, byte for byte — so a search that builds a program by
+concatenating actions ends with the text the converter emits.
+
 Install only the converter and validation dependencies with:
 
 ```bash
