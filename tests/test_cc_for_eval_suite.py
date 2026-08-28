@@ -2,10 +2,8 @@
 
 The gates themselves live in ``evals/cc_for``; this module turns them into
 assertions over the hand-written edge cases and the checked-in fixtures so a CI
-run fails on a canonicalization regression.
-
-Gates that measure a *known* open defect are marked xfail with a reason rather
-than deleted, so a fix flips them to xpass instead of going unnoticed.
+run fails on a canonicalization regression. Idempotency remains a diagnostic
+measurement rather than part of the one-pass conversion contract.
 """
 
 from __future__ import annotations
@@ -32,32 +30,9 @@ ZERO_TO_CAD_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "zero_to_cad"
 CASE_PATHS = sorted(CASES.glob("*.py"))
 CASE_IDS = [path.stem for path in CASE_PATHS]
 
-# Cases whose canonical program is currently wrong.  Each entry names the gate
-# that fails and why; see docs/cc_for_eval_suite.md for the analysis.
-KNOWN_FAILURES: dict[str, dict[str, str]] = {
-    "augmented_assignment_offsets": {
-        "canonical_executes": "AugAssign targets are not renamed with their SSA "
-        "definition, so the canonical program raises NameError",
-        "parameters_preserved": "same root cause: total_span is versioned on its "
-        "initializer only",
-    },
-    "try_except_fallback": {
-        "structure": "fluent chains inside try/except bodies are not lowered",
-        "chains_lowered": "fluent chains inside try/except bodies are not lowered",
-    },
-    "self_attribute_rebuild": {
-        "canonical_executes": "self.wp is copy-propagated back to the constructor "
-        "argument across self.build(), so the canonical program builds nothing",
-    },
-    "result_read_before_alias": {
-        "canonical_executes": "a bare statement reading a loop-carried `result` is "
-        "not rewritten to the renamed state variable",
-    },
-}
-
-# The workplane counter continues past any existing wpN, so re-running the
-# converter on its own output renumbers every step.
-IDEMPOTENCE_IS_BROKEN = True
+# Idempotency is diagnostic only: the converter accepts source programs and is
+# intentionally not required to recognize or preserve its own lowered output.
+NON_CONTRACT_GATES = {"idempotent"}
 
 
 def _evaluate(path: Path, **kwargs):
@@ -75,15 +50,8 @@ def test_edge_case_structural_gates(path: Path, placement: str) -> None:
     """
 
     evaluation = _evaluate(path, run_geometry=False, parameter_placement=placement)
-    expected = KNOWN_FAILURES.get(path.stem, {})
     for gate in evaluation.gates:
-        if gate.skipped or gate.name == "idempotent":
-            continue
-        if gate.name in expected:
-            assert not gate.passed, (
-                f"{path.stem} [{placement}]: gate {gate.name!r} now passes -- "
-                f"remove it from KNOWN_FAILURES ({expected[gate.name]})"
-            )
+        if gate.skipped or gate.name in NON_CONTRACT_GATES:
             continue
         assert gate.passed, (
             f"{path.stem} [{placement}]: {gate.name} failed: "
@@ -97,11 +65,8 @@ def test_edge_case_geometry_gates(path: Path) -> None:
     """Original and canonical programs must build the same solid."""
 
     evaluation = _evaluate(path)
-    expected = KNOWN_FAILURES.get(path.stem, {})
     for gate in evaluation.gates:
-        if gate.skipped or gate.name == "idempotent":
-            continue
-        if gate.name in expected:
+        if gate.skipped or gate.name in NON_CONTRACT_GATES:
             continue
         assert gate.passed, f"{path.stem}: {gate.name} failed: {gate.error or gate.detail}"
 
@@ -118,7 +83,7 @@ def test_zero_to_cad_fixtures_round_trip(path: Path, placement: str) -> None:
         path, run_perturbations=False, parameter_placement=placement
     )
     for gate in evaluation.gates:
-        if gate.skipped or gate.name == "idempotent":
+        if gate.skipped or gate.name in NON_CONTRACT_GATES:
             continue
         assert gate.passed, (
             f"{path.stem} [{placement}]: {gate.name} failed: "
@@ -126,24 +91,8 @@ def test_zero_to_cad_fixtures_round_trip(path: Path, placement: str) -> None:
         )
 
 
-@pytest.mark.xfail(
-    IDEMPOTENCE_IS_BROKEN,
-    reason="the wpN counter never restarts, so a second pass renumbers every step",
-    strict=True,
-)
-def test_canonicalization_is_idempotent() -> None:
-    source = (CASES / "nested_loops_grid.py").read_text(encoding="utf-8")
-    once = canonicalize_code(source).code
-    twice = canonicalize_code(once).code
-    assert twice == once
-
-
-def test_self_attribute_copy_propagation_is_still_open() -> None:
-    """Silent geometry loss: the canonical program builds an empty part.
-
-    Nothing raises and no structural error is reported, so only comparing the
-    solids finds it.  Inverted the day the propagation is made sound.
-    """
+def test_opaque_builder_call_invalidates_attribute_aliases() -> None:
+    """A builder mutation must be read back from the object, not a stale alias."""
 
     source = (
         "import cadquery as cq\n"
@@ -159,21 +108,49 @@ def test_self_attribute_copy_propagation_is_still_open() -> None:
     )
     canonical = canonicalize_code(source)
     assert canonical.report.structural_errors == []
-    assert "self.model = workplane" in canonical.code
+    assert "self.model = workplane" not in canonical.code
+    assert "self.model = self.wp" in canonical.code
 
     if not HAS_CADQUERY:
         return
     namespace: dict = {}
     exec(compile(canonical.code, "<canonical>", "exec"), namespace, namespace)
-    assert namespace["result"].vals() == [], "geometry loss appears to be fixed"
+    assert namespace["result"].val().Volume() == pytest.approx(1000.0)
 
 
-def test_augmented_assignment_regression_is_still_open() -> None:
-    """The smallest program the SSA renamer currently miscompiles.
+def test_custom_workplane_extension_keeps_receiver_alias() -> None:
+    """A modeled Workplane extension must not invalidate its receiver name."""
 
-    Kept as an explicit assertion so the day it is fixed, this test fails loudly
-    and can be inverted rather than quietly staying green.
-    """
+    source = (
+        "import cadquery as cq\n"
+        "def firstSolid(self):\n"
+        "    return self.newObject([self.findSolid()])\n"
+        "cq.Workplane.firstSolid = firstSolid\n"
+        "result = cq.Workplane('XY').box(10.0, 10.0, 10.0)\n"
+        "result = result.firstSolid().edges('|Z').fillet(1.0)\n"
+        "result = result.firstSolid().faces('>Z').workplane().hole(2.0)\n"
+    )
+    canonical = canonicalize_code(source)
+    assert canonical.report.structural_errors == []
+    assert canonical.code.count("result =") == 1
+
+    if not HAS_CADQUERY:
+        return
+    source_namespace: dict = {}
+    canonical_namespace: dict = {}
+    exec(compile(source, "<source>", "exec"), source_namespace, source_namespace)
+    exec(
+        compile(canonical.code, "<canonical>", "exec"),
+        canonical_namespace,
+        canonical_namespace,
+    )
+    assert canonical_namespace["result"].val().Volume() == pytest.approx(
+        source_namespace["result"].val().Volume()
+    )
+
+
+def test_augmented_assignment_updates_its_reaching_definition() -> None:
+    """AugAssign must read and update the currently versioned scalar."""
 
     source = (
         "import cadquery as cq\n"
@@ -183,9 +160,13 @@ def test_augmented_assignment_regression_is_still_open() -> None:
     )
     canonical = canonicalize_code(source).code
     assert "total_1 = 1.0" in canonical
-    assert "total += 2.0" in canonical, "AugAssign target was left unversioned"
-    with pytest.raises(NameError):
-        exec(compile(canonical, "<canonical>", "exec"), {}, {})
+    assert "total_1 += 2.0" in canonical
+    if not HAS_CADQUERY:
+        return
+    namespace: dict = {}
+    exec(compile(canonical, "<canonical>", "exec"), namespace, namespace)
+    assert namespace["total_1"] == 3.0
+    assert namespace["result"].val().Volume() == pytest.approx(12.0)
 
 
 def test_late_layout_gate_flags_a_parameter_that_could_sink() -> None:

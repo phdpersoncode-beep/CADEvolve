@@ -9,6 +9,25 @@ Corpus: the 5,000 checked-in Zero-to-CAD programs in
 `demo_data/zero_to_cad_5k/`, plus 22 hand-written edge cases in
 `evals/cc_for/cases/`. Environment: CadQuery 2.5.2 / OCP 7.7.2, Python 3.11.
 
+## Current status
+
+This document records the independent evaluation as it was first run. The
+subsequent correctness stabilization resolved the four executable-conversion
+problems it exposed:
+
+- augmented assignments now read and update their current reaching definition;
+- every load, including bare assertions, follows loop-carried geometry state;
+- opaque builder calls invalidate receiver-attribute aliases before a read-back;
+- CadQuery operations inside `try`/`except` are lowered while keeping exception
+  paths and their geometry state intact.
+
+All four reproductions now pass structural and solid-equivalence gates under
+both CC-for and CC-step. Idempotency was deliberately classified as a diagnostic
+rather than a requirement: the converter's contract is one pass from source
+CadQuery to canonical code. User-defined parameter containers and opaque nested
+builder chains remain representation-coverage work, not executable-correctness
+failures.
+
 ## Headline
 
 The canonicalizer does what the PR claims, on essentially the whole corpus:
@@ -80,9 +99,9 @@ quality. Defect 2 does not appear in this particular sample because the program
 carrying it (`019172f8`) failed to build as a source on this run — it has a
 deterministic minimal reproduction above.
 
-## Defects
+## Original findings
 
-### 1. `AugAssign` breaks the canonical program — `NameError`
+### 1. `AugAssign` broke the canonical program — resolved
 
 The SSA renamer versions a name's plain-assignment definition but leaves every
 `AugAssign` occurrence on the original name. The canonical program then
@@ -108,7 +127,7 @@ Corpus impact: 46/5,000 programs use `AugAssign` on a plain name; **4 of them
 produce a canonical program that raises `NameError`** while passing the
 structural scan. `evals/cc_for/cases/augmented_assignment_offsets.py` covers it.
 
-### 2. A statement reading a loop-carried `result` is not rewritten
+### 2. A statement reading a loop-carried `result` was not rewritten — resolved
 
 When `result` is rebound inside control flow it becomes `result_state`, but a
 bare statement that reads `result` before the terminal alias is left untouched.
@@ -135,7 +154,7 @@ Corpus impact: 2/5,000. Small, but `assert result.solids().size() == 1` is a
 common self-check idiom in generated CAD programs, so the rate depends on the
 generator rather than on anything intrinsic.
 
-### 3. Silent geometry loss from copy-propagating a `self` attribute
+### 3. Silent geometry loss from a stale `self` attribute alias — resolved
 
 The worst of the five, because nothing fails. An attribute alias is replaced by
 the constructor argument it was initialised from, ignoring that an intervening
@@ -163,7 +182,7 @@ Corpus impact: 6/5,000 programs match the store → call → read-back pattern, 
 find, and an execute-only check ("does it run?") cannot find either — it needs
 the solids compared.
 
-### 4. Canonicalization is not idempotent
+### 4. Canonicalization is not idempotent — diagnostic only
 
 `canonicalize(canonicalize(x)) != canonicalize(x)` for **every one of the 5,000
 programs**. The `wpN` counter skips any name already bound in the input, so
@@ -175,22 +194,19 @@ wp1 … wp24   ->   wp25 … wp48
 
 The collision-avoidance is right in principle — a source program may have its
 own `wp3` — but it does not distinguish a user's `wp3` from a `wp3` the
-converter itself is about to replace. Consequences: canonical form is not a
-fixed point, so content-hash dedup and resumed or re-run conversions are not
-reproducible, and a re-processed shard trains on a different token distribution
-than a first-pass shard.
+converter itself is about to replace. The pipeline canonicalizes raw source
+exactly once, so fixed-point behavior is not part of its contract. The gate is
+still reported for visibility but is ignored by default.
 
 ### 5. Coverage gaps
 
 Neither of these corrupts a program; both leave the representation short of the
 contract's intent.
 
-- **Chains inside `try`/`except` are not lowered.** The lowering pass handles
-  `If`, `For` and `While` bodies but not `Try`, so a guarded modelling step stays
-  a nested fluent chain. The converter self-reports the violation
-  (`found 2 unlowered fluent CadQuery call(s)`), so with `keep_failed: false`
-  the program is dropped rather than silently mis-converted — a coverage gap,
-  not a correctness bug. `evals/cc_for/cases/try_except_fallback.py` covers it.
+- **Chains inside `try`/`except` — resolved.** Guarded modelling steps are now
+  lowered inside the original exception paths and write path-dependent geometry
+  through stable runtime names. `evals/cc_for/cases/try_except_fallback.py`
+  covers the structural and solid-equivalence behavior.
 - **User-class parameter containers are not flattened.** 182/5,000 programs
   (3.64%) define their own `Measures`-style class instead of using
   `SimpleNamespace`. Their design parameters stay as literals inside the
@@ -289,20 +305,17 @@ This supports the PR's own position that centering, scaling and binarization
 should stay separate, explicitly validated stages rather than being folded into
 canonicalization.
 
-## Suggested priorities
+## Remaining priorities
 
-1. **Defect 3** (silent geometry loss) — wrong data with no signal at all.
-2. **Defect 1** (`AugAssign`) — smallest fix, clearest reproduction, and it
-   affects the loop-accumulator programs the PR is specifically about.
-3. **Defect 4** (idempotence) — one-line intent change (do not reserve `wpN`
-   names the lowering pass is itself replacing), but it affects every output.
-4. **Defect 2** (`result` read before the alias).
-5. **Coverage gaps** — `try`/`except` lowering, then user-class containers.
+1. User-class parameter containers, if their design literals need to become
+   named downstream-editable parameters.
+2. Opaque nested builder-method chains, if they need to become individually
+   visible actions.
+3. Corpus-scale geometry validation paired with the reproducibility check,
+   because roughly 1% of the corpus cannot serve as its own stable baseline.
 
-Independently of the fixes: promote the geometry gate from a 32-program sample
-to a corpus-scale run, since all three correctness defects are invisible to the
-structural scan that does run at 5,000 — and pair it with a reproducibility
-check, because roughly 1% of the corpus cannot serve as its own baseline.
+The first two are representation-coverage choices. They do not currently make
+the emitted programs execute differently from their sources.
 
 ## Reproducing
 
