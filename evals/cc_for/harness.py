@@ -32,6 +32,7 @@ from utils.canonicalization.cc_for import (
     CCForConfig,
     canonicalize_code,
     decompose_actions,
+    join_actions,
     validate_structure,
 )
 
@@ -463,6 +464,42 @@ def evaluate_program(
             ),
         )
     )
+
+    def _loop_bindings() -> tuple[bool, dict[str, Any]]:
+        """A loop that stops writing its accumulator is silent geometry loss.
+
+        The structural scan is the only gate that runs corpus-wide, so a defect
+        it cannot see is a defect measured on a sample.  This one is visible in
+        the AST: the canonical program still reads the name inside the loop and
+        no longer binds it there, which means every iteration reads the
+        initializer.
+        """
+
+        dropped = code_metrics.dropped_loop_bindings(source, canonical, result_name)
+        return not dropped, {"dropped": dropped}
+
+    gates.append(_run_gate("loop_bindings_preserved", _loop_bindings))
+
+    def _actions_reassemble() -> tuple[bool, dict[str, Any]]:
+        """Concatenating the actions has to give the canonical program back.
+
+        A search builds its program by joining the actions it chose; if that join
+        is not the converter's own text, an exact-match score or a dedup hash
+        sees two different programs.
+        """
+
+        actions = decompose_actions(
+            canonical,
+            result_name=result_name,
+            parameter_placement=parameter_placement,
+        )
+        rebuilt = join_actions(actions)
+        return rebuilt == canonical, {
+            "actions": len(actions),
+            "matches": rebuilt == canonical,
+        }
+
+    gates.append(_run_gate("actions_reassemble", _actions_reassemble))
 
     evaluation = ProgramEvaluation(
         name=name,

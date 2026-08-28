@@ -31,6 +31,8 @@ the **canonical** code, and the **solids** both produce.
 | `loops_preserved` | Same number of `for` loops in preserve mode. |
 | `literals_stable` | No numeric or string literal invented or dropped. |
 | `chains_lowered` | Every modelling call is its own `wpN` assignment. |
+| `loop_bindings_preserved` | Does every loop still write the accumulator it wrote in the source? |
+| `actions_reassemble` | Does `join_actions(decompose_actions(code))` give the canonical program back? |
 | `source_executes` / `canonical_executes` | Both build a valid shape. |
 | `source_deterministic` | Does the source program build the same solid twice? |
 | `topology_identical` | Solids, shells, faces, wires, edges, vertices, face/edge type histograms, volume, area, bounding box, centre of mass. |

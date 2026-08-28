@@ -763,6 +763,75 @@ def design_parameters(code: str, result_name: str = "result") -> set[str]:
     return numeric
 
 
+def _ssa_stem(name: str) -> str:
+    """``thickness_2`` -> ``thickness``; anything else unchanged."""
+
+    match = _SSA_SUFFIX.match(name)
+    return match.group("stem") if match else name
+
+
+def loop_body_bindings(code: str) -> set[str]:
+    """Names bound inside a loop -- its target or anywhere in its body.
+
+    Reported per name rather than per loop because lowering redistributes a
+    body's statements: what has to survive is that the loop still writes the
+    name, not that it writes it in the same statement.
+    """
+
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(code)):
+        if not isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            continue
+        subtrees = list(node.body)
+        target = getattr(node, "target", None)
+        if target is not None:
+            subtrees.append(target)
+        for subtree in subtrees:
+            for child in ast.walk(subtree):
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                    names.add(child.id)
+    return names
+
+
+def loop_body_reads(code: str) -> set[str]:
+    """Names read inside a loop body."""
+
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(code)):
+        if not isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+            continue
+        for stmt in node.body:
+            for child in ast.walk(stmt):
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                    names.add(child.id)
+    return names
+
+
+def dropped_loop_bindings(
+    source: str, canonical: str, result_name: str = "result"
+) -> list[str]:
+    """Names a loop wrote in the source and no longer writes in the canonical code.
+
+    A loop-carried accumulator that stops being assigned is the shape of silent
+    geometry loss: the canonical program runs, keeps the structural contract, and
+    builds whatever the initializer held.  Only names the canonical program still
+    *reads* inside a loop count, so a value the lowerer legitimately replaced with
+    its own ``wpN`` -- or renamed, as ``result`` becomes ``result_state`` -- is not
+    reported.  SSA suffixes are stripped before comparing.
+    """
+
+    written = {_ssa_stem(name) for name in loop_body_bindings(source)}
+    rewritten = {_ssa_stem(name) for name in loop_body_bindings(canonical)}
+    still_read = {_ssa_stem(name) for name in loop_body_reads(canonical)}
+    return sorted(
+        name
+        for name in written - rewritten
+        if name in still_read
+        and name != result_name
+        and not name.startswith(_GENERATED_PREFIXES)
+    )
+
+
 def loop_count(code: str) -> int:
     return sum(
         1 for node in ast.walk(ast.parse(code)) if isinstance(node, (ast.For, ast.AsyncFor))

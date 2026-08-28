@@ -53,6 +53,10 @@ KNOWN_FAILURES: dict[str, dict[str, str]] = {
         "canonical_executes": "a bare statement reading a loop-carried `result` is "
         "not rewritten to the renamed state variable",
     },
+    "loop_over_geometry_iterable": {
+        "structure": "a fluent chain in a `for` header is not lowered; the loop "
+        "body and the header's names are, the iterable expression is not",
+    },
 }
 
 # The workplane counter continues past any existing wpN, so re-running the

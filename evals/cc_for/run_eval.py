@@ -58,6 +58,8 @@ GATE_ORDER = (
     "loops_unrolled",
     "literals_stable",
     "chains_lowered",
+    "loop_bindings_preserved",
+    "actions_reassemble",
     "source_executes",
     "canonical_executes",
     "source_deterministic",
