@@ -27,7 +27,9 @@ There is exactly one terminal `result = ...` assignment. For Step-ToCAD action
 decomposition, the parameter preamble is one action, every other top-level AST
 statement is one action, and the terminal `result` alias is folded into the preceding
 modeling action. Under CC-step only the docstring and imports form a standalone
-header; each parameter group joins the modeling action it was placed for.
+header; each parameter group joins the modeling action it was placed for. Either way
+`join_actions` reassembles the actions into the canonical program byte for byte, so
+the program a search ends with is the program the converter emits.
 
 ## Pipeline
 

@@ -16,6 +16,7 @@ from dataset_utils.utils.canonicalization.cc_for import (
     CCForConfig,
     canonicalize_code,
     decompose_actions,
+    join_actions,
     validate_structure,
 )
 from dataset_utils.utils.canonicalization.cc_for_validation import (
@@ -379,10 +380,52 @@ result = base.faces('>Z').workplane().hole(hole_diameter)
             any("hole_diameter = 5" in action.code for action in actions[2:])
         )
         # Every action still runs as a prefix of the ones before it.
-        self.assertEqual(
-            "\n".join(action.code for action in actions).strip(),
-            converted.code.strip(),
-        )
+        self.assertEqual(join_actions(actions), converted.code)
+
+    def test_actions_reassemble_a_program_that_defines_a_helper(self) -> None:
+        """Concatenating the actions has to give back the canonical text.
+
+        A tree search builds its program by joining the actions it chose, so the
+        text it ends with is only comparable to the dataset if it is the same
+        text.  Unparsing a module spaces a top-level ``def`` out from what
+        precedes it and unparsing that ``def`` alone does not, which is the one
+        way a plain join drifts.
+        """
+
+        source = """
+import cadquery as cq
+wall = 3.0
+rib_height = 5.0
+
+def rib(wp, width):
+    return wp.faces('>Z').workplane().rect(width, wall).extrude(rib_height)
+plate_size = 40.0
+plate = cq.Workplane('XY').box(plate_size, plate_size, 4.0)
+result = rib(plate, 8.0)
+"""
+        for placement in ("preamble", "late"):
+            with self.subTest(placement=placement):
+                converted = convert(source, placement)
+                actions = decompose_actions(
+                    converted.code, parameter_placement=placement
+                )
+                self.assertEqual(join_actions(actions), converted.code)
+                self.assertNotEqual(
+                    "\n".join(action.code for action in actions), converted.code
+                )
+
+    def test_every_fixture_reassembles_from_its_actions(self) -> None:
+        sources = sorted(FIXTURES.glob("*.py")) + sorted(CASES.glob("*.py"))
+        for fixture in sources:
+            for placement in ("preamble", "late"):
+                with self.subTest(fixture=fixture.name, placement=placement):
+                    converted = convert(
+                        fixture.read_text(encoding="utf-8"), placement
+                    )
+                    actions = decompose_actions(
+                        converted.code, parameter_placement=placement
+                    )
+                    self.assertEqual(join_actions(actions), converted.code)
 
 
 @unittest.skipUnless(HAS_CADQUERY, "CadQuery is required for geometry validation")

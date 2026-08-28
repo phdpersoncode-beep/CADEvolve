@@ -2557,6 +2557,36 @@ def _decompose_late_actions(
     return header, groups
 
 
+def _opens_with_definition(code: str) -> bool:
+    """Whether ``code`` starts with the kind of statement unparsing spaces out."""
+
+    body = ast.parse(code).body
+    return bool(body) and isinstance(
+        body[0], (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    )
+
+
+def join_actions(actions: Sequence[CanonicalAction]) -> str:
+    """Reassemble the canonical program text from its actions.
+
+    A tree search over actions builds its program by concatenating them, so the
+    text it ends with has to be the text the converter emits -- otherwise an
+    exact-match score or a dedup hash sees two different programs.  Unparsing a
+    whole module puts a blank line before every top-level ``def`` or ``class``
+    that is not the first statement of the module; unparsing that statement as
+    its own action does not, because there it *is* first.  Restoring that one
+    separator is the whole difference.
+    """
+
+    chunks: list[str] = []
+    for index, action in enumerate(actions):
+        code = action.code
+        if index and _opens_with_definition(code):
+            code = "\n" + code
+        chunks.append(code)
+    return "\n".join(chunks).rstrip() + "\n"
+
+
 def decompose_actions(
     code: str,
     result_name: str = "result",
@@ -2601,5 +2631,6 @@ __all__ = [
     "ParameterPlacement",
     "canonicalize_code",
     "decompose_actions",
+    "join_actions",
     "validate_structure",
 ]

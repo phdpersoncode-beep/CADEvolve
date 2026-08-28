@@ -96,6 +96,21 @@ decompose_actions(code, parameter_placement="late")
 #  ...]
 ```
 
+A search builds its program by concatenating the actions it chose, so that
+concatenation has to be the text the converter emits -- otherwise an exact-match
+score or a dedup hash sees two different programs. `join_actions` is that
+concatenation:
+
+```python
+join_actions(decompose_actions(code, parameter_placement="late")) == code
+```
+
+The one place a plain `"\n".join` drifts is a top-level `def` or `class`:
+unparsing a module spaces it out from the statement before it, unparsing it
+alone as its own action does not. That affects 798 of the 5,000 demo programs
+under both placements; `join_actions` restores the separator and reproduces the
+canonical text for all 5,000.
+
 ## Producing it
 
 ```python
