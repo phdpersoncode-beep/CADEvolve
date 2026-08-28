@@ -246,6 +246,14 @@ CC-step splits the snapshot into a mean of 4.00 parameter groups per program
 (median 4, max 12) against CC-for's single preamble. Parameter retention is
 0.9999 in both; design-parameter coverage is 0.995.
 
+The 74 snapshot programs whose output this branch changes were re-run on their
+own under the full geometry gates: 74/74 pass under `preamble` and 73/74 under
+`late`, the exception being a program the legacy binarizer cannot round — its
+binarized *source* does not build either, on this branch or on the merge base,
+under either representation. That is the binarizer-damage boundary
+[`cc_for_eval_suite.md`](cc_for_eval_suite.md) already describes, not a placement
+result; the same program's unbinarized solid is exact under both placements.
+
 Every failing set above is the same set of programs the converter failed before
 the placement rule changed — measured by running the same scan on the merge base:
 `parameters_preserved` 10, `parameters_hoisted` 7, `chains_lowered` 5,
