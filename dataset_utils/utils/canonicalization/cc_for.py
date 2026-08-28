@@ -2198,6 +2198,20 @@ class _WorkplaneLowerer:
                     initializer = self._materialize_alias(name, aliases, dynamic)
                     if initializer is not None:
                         output.append(ast.copy_location(initializer, stmt))
+                # A ``while`` carries geometry across iterations exactly as a
+                # ``for`` does, so its accumulators need the same stable runtime
+                # name.  Without this the body's ``acc = ...`` is recorded as an
+                # alias and never written back: the next iteration and the code
+                # after the loop both still read the initializer, and the part
+                # loses every body the loop built without raising anything.
+                carried = _assigned_names(
+                    ast.Module(body=stmt.body, type_ignores=[])
+                ) & _loads_before_definition(stmt.body)
+                for name in sorted(
+                    (carried & self._geometry_assignment_candidates(stmt.body))
+                    - set(aliases)
+                ):
+                    dynamic.setdefault(name, self._state_name(name))
                 stmt.test = _rewrite_loads(stmt.test, aliases)
                 stmt.body, _, _ = self._lower_block(
                     stmt.body,

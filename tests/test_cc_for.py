@@ -432,6 +432,36 @@ result = accumulator
         validation = validate_round_trip(source, converted.code)
         self.assertTrue(validation.success, validation.to_dict())
 
+    def test_while_carried_geometry_accumulator_is_written_back(self) -> None:
+        """A ``while`` carries geometry the same way a ``for`` does.
+
+        Without the stable runtime name, the body's ``accumulator = ...`` is
+        recorded as an alias and never emitted: the next iteration and the code
+        after the loop both still read the ``None`` initializer, so the canonical
+        program runs, keeps the structural contract, and builds nothing.
+        """
+
+        source = """
+import cadquery as cq
+count = 3
+spacing = 3
+accumulator = None
+index = 0
+while index < count:
+    piece = cq.Workplane('XY').box(1, 1, 1).translate((index * spacing, 0, 0))
+    accumulator = piece if accumulator is None else accumulator.union(piece)
+    index = index + 1
+result = accumulator
+"""
+        for placement in ("preamble", "late"):
+            with self.subTest(placement=placement):
+                converted = canonicalize_code(
+                    source, CCForConfig(parameter_placement=placement)
+                )
+                self.assertRegex(converted.code, r"accumulator = wp\d+")
+                validation = validate_round_trip(source, converted.code)
+                self.assertTrue(validation.success, validation.to_dict())
+
     def test_user_examples_survive_symbolic_numeric_binarization(self) -> None:
         for name in (
             "mounting_base_with_boss.py",
