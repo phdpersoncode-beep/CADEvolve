@@ -1,0 +1,31 @@
+{
+  "archive": "raw_sources.tar.gz",
+  "archive_bytes": 1606732,
+  "archive_sha256": "319c840e39a6c756afef578efad22683df98b0e82f258bd9164f563ab54fa048",
+  "dataset": "ADSKAILab/Zero-To-CAD-100k",
+  "dataset_revision": "48bcf0a8c6fbfb47a27f5662007c24dff8d754ae",
+  "dataset_url": "https://huggingface.co/datasets/ADSKAILab/Zero-To-CAD-100k",
+  "format_version": 1,
+  "members": 5000,
+  "parquet_shards": [
+    "0000.parquet",
+    "0001.parquet",
+    "0002.parquet",
+    "0003.parquet",
+    "0004.parquet",
+    "0005.parquet",
+    "0006.parquet",
+    "0007.parquet",
+    "0008.parquet",
+    "0009.parquet"
+  ],
+  "selection": {
+    "count": 5000,
+    "offset": 0,
+    "order": "Parquet filename ascending, then stored row order"
+  },
+  "source_bytes": 7546793,
+  "source_content_sha256": "67536c0fe1bae9ed88cb328db82040778f60499d48165d61bffad11f84d6feec",
+  "split": "train",
+  "upstream_license": "Apache-2.0"
+}

@@ -1,0 +1,14 @@
+root_dir: sampled
+out_dir: cc_for
+report_path: logs/cc_for.jsonl
+flat: false
+
+n_workers: 1
+loop_mode: preserve
+max_unroll_iterations: 64
+
+validate_execution: true
+validate_prefix_execution: true
+validate_perturbations: false
+max_perturbed_parameters: 16
+keep_failed: false
