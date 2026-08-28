@@ -6,8 +6,12 @@ branch `agent/cc-for-canonicalization`) using the suite in
 [`evals/cc_for/`](../evals/cc_for/README.md).
 
 Corpus: the 5,000 checked-in Zero-to-CAD programs in
-`demo_data/zero_to_cad_5k/`, plus 22 hand-written edge cases in
+`demo_data/zero_to_cad_5k/`, plus the hand-written edge cases in
 `evals/cc_for/cases/`. Environment: CadQuery 2.5.2 / OCP 7.7.2, Python 3.11.
+
+A later pass over CC-step found three more, recorded in
+[a second section below](#a-second-pass-what-the-cc-step-verification-found);
+those are fixed, with the two that a structural scan can see now gated.
 
 ## Headline
 
@@ -204,6 +208,93 @@ contract's intent.
   converter cannot tell that a user method returns geometry. Each is a modelling
   step that the action decomposition does not see.
 
+## A second pass: what the CC-step verification found
+
+Three further defects, found by running CC-step over the same 5,000 programs and
+by hand-written probes around loops and parameter placement. All three predate
+CC-step and affect both representations; all three are fixed on this branch, with
+regression cases in `evals/cc_for/cases/`.
+
+### 6. A `while` loop's geometry accumulator is never written back
+
+`for` pre-declares a loop-carried geometry name so the body's assignment is
+emitted; `while` did not, so the assignment was recorded as an alias and dropped.
+
+```python
+# source
+pegs = None
+index = 0
+while index < peg_count:
+    peg = cq.Workplane("XY").center(...).circle(peg_radius).extrude(peg_height)
+    pegs = peg if pegs is None else pegs.union(peg)
+    index = index + 1
+result = base.union(pegs)
+
+# canonical, before the fix -- note that nothing assigns `pegs`
+while index < peg_count:
+    ...
+    if pegs is None:
+        wp8 = wp6
+    else:
+        wp7 = pegs.union(wp6)
+        wp8 = wp7
+    index = index + 1
+wp9 = wp2.union(pegs)          # pegs is still None: every peg is gone
+```
+
+The canonical program runs, keeps the structural contract, and builds the base
+with no pegs on it. 2/5,000 corpus programs match the pattern, and both lose
+geometry (one drops an entire internal lattice: volume 17,663 against 19,313).
+`evals/cc_for/cases/while_carried_union_accumulator.py` covers it, and a
+corpus-wide check — *is every name the source binds inside a loop body still
+bound inside a loop body?* — now reports 0/5,000.
+
+### 7. A parameter moved across the statement that rebinds it
+
+A name a loop or a branch also writes keeps one stable binding through renaming,
+so both definitions reach the placement stage. The movability predicate looked at
+what a statement *read*, not at what it *bound*, so the plain definition counted
+as a parameter and moved — CC-for above the loop, CC-step below it.
+
+```python
+tallest = 0.5
+for rib_height in rib_heights:
+    if rib_height > tall_threshold:
+        tallest = rib_height
+result = plate.faces(">Z").workplane().circle(6.0).extrude(tallest)
+```
+
+Under CC-step the initializer sank below the loop and the boss came out 0.5 tall
+instead of 6.0; the mirror program, with the reset *after* the loop, catches
+CC-for the same way. Excluding rebound names fixes both and changes 72/5,000
+CC-for and 61/5,000 CC-step outputs, all of them corrections. Covered by
+`conditional_loop_accumulator.py` and `late_reinitialized_accumulator.py`.
+
+### 8. Actions did not reassemble into the canonical program
+
+Concatenating the emitted actions is how a tree search builds its program, so the
+concatenation has to be the text the converter emits. Unparsing a module spaces a
+top-level `def` or `class` out from the statement before it; unparsing that
+statement alone as its own action does not, so a plain `"\n".join` of the actions
+differed from the canonical code for **798/5,000** programs under both
+placements. `join_actions` restores the separator and now reproduces the
+canonical text for 5,000/5,000.
+
+### Two limits left in place
+
+- **A fluent chain in a `for` header is not lowered.** The loop body and the
+  header's names are rewritten, `part.faces('>Z').vals()` in
+  `for face in part.faces('>Z').vals():` is not. Self-reported by
+  `validate_structure`, like the `try`/`except` gap above, and absent from the
+  demo corpus. `evals/cc_for/cases/loop_over_geometry_iterable.py` keeps it
+  visible.
+- **A value derived from a rebound name cannot sink either.** Excluding rebound
+  names also excludes everything derived from them, so under CC-step such a chain
+  stays where the source put it and `parameters_placed_late` reports it — 2/5,000
+  programs. Sinking it safely needs a per-parameter bound on how far it may
+  travel rather than a yes/no predicate, which is a change to the representation
+  rather than a fix to it.
+
 ## Why the existing validation did not catch these
 
 The PR reports 5,000/5,000 passing and 32/32 on the geometry gates. Both numbers
@@ -297,7 +388,14 @@ canonicalization.
 3. **Defect 4** (idempotence) — one-line intent change (do not reserve `wpN`
    names the lowering pass is itself replacing), but it affects every output.
 4. **Defect 2** (`result` read before the alias).
-5. **Coverage gaps** — `try`/`except` lowering, then user-class containers.
+5. **Coverage gaps** — `try`/`except` lowering, then user-class containers,
+   then a fluent chain in a `for` header.
+
+Defects 6-8 from the second pass are already fixed on the CC-step verification
+branch; the two structural ones now run corpus-wide as `loop_bindings_preserved`
+and `actions_reassemble`, which is the shape the recommendation below asks for:
+a defect the 5,000-program scan can see should be measured there rather than on
+a sample.
 
 Independently of the fixes: promote the geometry gate from a 32-program sample
 to a corpus-scale run, since all three correctness defects are invisible to the

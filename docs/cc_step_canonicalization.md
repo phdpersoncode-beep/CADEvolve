@@ -70,16 +70,47 @@ statements count as parameters. Four cases are worth naming:
 - **`from math import ...`.** `radians(a)` is parameter algebra exactly as
   `math.radians(a)` is. Without this a program that writes the bare form looks
   like it starts modelling at its first derived angle.
-
-CC-step declines to move one class of statement CC-for hoists: a name defined
-more than once at top level, such as a loop-carried accumulator's initializer.
-Hoisting every definition into one preamble preserves their relative order, so
-CC-for gets away with it; sinking them to different steps would not.
+- **A name a second statement binds.** No parameter may cross a statement that
+  rebinds it, so a name bound anywhere else at top level is not a parameter for
+  either representation. Reaching-definition renaming versions the ordinary
+  case, but a name a loop or a branch also writes has to keep one stable
+  binding, and both definitions reach this stage. Moving the plain one is then
+  unsound in either direction: CC-for hoists an accumulator's initializer above
+  the loop that updates it, CC-step sinks it below, and both read a value the
+  source never produced. Neither shows up as an error -- the program runs, keeps
+  the structural contract, and builds a different part.
 
 Parameters nothing reads have no step to anchor to. They settle against their
 own dependencies and readers rather than against the modelling code, and a
 define-before-use check over the result falls back to source positions if that
 settlement ever produced an order Python would reject.
+
+## Loops
+
+Placement does not touch loops, and that is a claim worth stating rather than
+assuming, because CC-step is the representation that moves code *past* them.
+Three properties hold, each measured over the 5,000-program Zero-to-CAD snapshot
+(1,371 of which contain a `for` loop):
+
+- **The loop survives as one statement.** `for` count and nesting depth are
+  identical in source and canonical code for every program. Lowering descends
+  into the body and the `else` clause, so a chain inside a loop becomes its own
+  run of `wpN` steps, but the `for` itself is never unrolled, split, or merged.
+  It is therefore one action: a search picks a whole loop or none of it.
+- **A loop's parameters arrive with the loop.** Reader detection walks the whole
+  statement, so a name read anywhere inside a loop -- header, body, `else`, or a
+  helper the body calls -- anchors the parameter to the loop, and a parameter
+  only a *later* loop reads sinks past the earlier one.
+- **Loop-carried state stays where it is.** A name the loop rebinds is not a
+  parameter at all (see the placement rule), so an accumulator's initializer
+  keeps its position relative to the loop that updates it.
+
+The one loop shape the representation does not fully lower is a fluent chain in
+the loop *header*, as in `for face in part.faces('>Z').vals():`. The body and
+the header's names are rewritten, the iterable expression is not, so
+`validate_structure` reports an unlowered call rather than emitting a program
+that quietly means something else. It does not occur in the demo corpus;
+`evals/cc_for/cases/loop_over_geometry_iterable.py` keeps it visible.
 
 ## Actions
 
@@ -180,7 +211,8 @@ PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_representations \
 
 ## Measured results
 
-Zero-to-CAD and CADEvolve-P fixtures (12 programs), full geometry gates:
+Zero-to-CAD and CADEvolve-P fixtures (12 programs), full geometry gates
+including quantization and parameter perturbation:
 
 | corpus                        | placement  | programs | gates passed | exact voxel IoU |
 | ----------------------------- | ---------- | -------- | ------------ | --------------- |
@@ -193,18 +225,33 @@ splits those 12 programs into a median of 4 parameter groups (min 2, max 9).
 Four-way representation agreement over the same 12 programs: every
 representation builds, and all four comparison pairs pass at voxel IoU 1.000.
 
-Edge cases (`evals/cc_for/cases`, 24 programs, full geometry gates) fail the
-same four programs under both placements, for the reasons recorded in
-[`cc_for_eval_suite.md`](cc_for_eval_suite.md); the 21 that build reach voxel
-IoU 1.000 with zero Chamfer distance against the source solid.
+Edge cases (`evals/cc_for/cases`, 29 programs, full geometry gates) fail only
+the programs recorded in [`cc_for_eval_suite.md`](cc_for_eval_suite.md); the
+rest reach voxel IoU 1.000 with zero Chamfer distance against the source solid.
 
-Structural sweep over 500 demo programs:
+Structural sweep over the full 5,000-program Zero-to-CAD snapshot, both
+placements, 2,082 loops preserved and 110,696 Workplane steps emitted:
 
-| placement  | passed  | `parameters_hoisted` / `parameters_placed_late` | parameter groups (mean) |
-| ---------- | ------- | ----------------------------------------------- | ----------------------- |
-| `preamble` | 497/500 | 500/500                                         | 1                       |
-| `late`     | 497/500 | 500/500                                         | 4.23                    |
+| gate                                            | `preamble` | `late`    |
+| ----------------------------------------------- | ---------- | --------- |
+| `converts` / `structure`                        | 5000/5000  | 5000/5000 |
+| `loops_preserved` / `literals_stable`           | 5000/5000  | 5000/5000 |
+| `loop_bindings_preserved`                       | 5000/5000  | 5000/5000 |
+| `actions_reassemble`                            | 5000/5000  | 5000/5000 |
+| `parameters_hoisted` / `parameters_placed_late` | 4993/5000  | 4998/5000 |
+| `parameters_preserved`                          | 4990/5000  | 4990/5000 |
+| `chains_lowered`                                | 4995/5000  | 4995/5000 |
 
-Both placements fail exactly the same three programs — two `parameters_preserved`
-and one `chains_lowered` — all pre-existing CC-for defects rather than placement
-failures.
+CC-step splits the snapshot into a mean of 4.00 parameter groups per program
+(median 4, max 12) against CC-for's single preamble. Parameter retention is
+0.9999 in both; design-parameter coverage is 0.995.
+
+Every failing set above is the same set of programs the converter failed before
+the placement rule changed — measured by running the same scan on the merge base:
+`parameters_preserved` 10, `parameters_hoisted` 7, `chains_lowered` 5,
+`parameters_placed_late` 2, identical program-for-program under both placements.
+They are the pre-existing CC-for defects recorded in
+[`cc_for_eval_suite.md`](cc_for_eval_suite.md). Both `parameters_placed_late`
+failures are the conservative-pinning limit described above: a value derived from
+a name control flow rebinds cannot move, so it stays where the source put it and
+the layout gate reports it.
