@@ -9,7 +9,7 @@ Corpus: the 5,000 checked-in Zero-to-CAD programs in
 `demo_data/zero_to_cad_5k/`, plus the hand-written edge cases in
 `evals/cc_for/cases/`. Environment: CadQuery 2.5.2 / OCP 7.7.2, Python 3.11.
 
-A later pass over CC-step found three more, recorded in
+A later pass over CC-step found five more, recorded in
 [a second section below](#a-second-pass-what-the-cc-step-verification-found);
 those are fixed, with the two that a structural scan can see now gated.
 
@@ -210,10 +210,11 @@ contract's intent.
 
 ## A second pass: what the CC-step verification found
 
-Three further defects, found by running CC-step over the same 5,000 programs and
-by hand-written probes around loops and parameter placement. All three predate
-CC-step and affect both representations; all three are fixed on this branch, with
-regression cases in `evals/cc_for/cases/`.
+Five further defects, found by running CC-step over the same 5,000 programs, by
+hand-written probes around loops and parameter placement, and by promoting the
+source-versus-canonical solid comparison from a sample to the whole corpus. All
+five predate CC-step and affect both representations; all five are fixed on this
+branch, with regression cases in `evals/cc_for/cases/`.
 
 ### 6. A `while` loop's geometry accumulator is never written back
 
@@ -279,6 +280,54 @@ statement alone as its own action does not, so a plain `"\n".join` of the action
 differed from the canonical code for **798/5,000** programs under both
 placements. `join_actions` restores the separator and now reproduces the
 canonical text for 5,000/5,000.
+
+### 9. A `for` target kept an alias from an earlier loop
+
+Found by running the source-versus-canonical solid comparison over all 5,000
+programs rather than a sample. Inside a `def` the renamer leaves locals alone,
+so one name can be both an assignment target in one loop and the iteration
+variable of the next. The lowerer aliased the first to its `wpN` and never
+cleared it:
+
+```python
+# source                              # canonical, before the fix
+for x, y in rib_coords:               for x, y in rib_coords:
+    rib = ...build...                     wp17 = ...build...
+    ribs.append(rib)                      ribs.append(wp17)
+for rib in ribs:                      for rib in ribs:
+    base = base.union(rib)                wp18 = base.union(wp17)
+```
+
+The union runs four times over the last rib. One Zero-to-CAD program hit it and
+came out 432 mm³ light with 15 faces missing, while running cleanly and keeping
+the structural contract. A `for` target now clears its alias, after the iterable
+is rewritten, since the iterable is evaluated before the first bind.
+`evals/cc_for/cases/loop_target_reuses_geometry_name.py` covers it.
+
+### 10. An attribute target rebound inside a branch kept its alias
+
+`_assigned_names` collects `Name` stores, so a branch that writes `self.model`
+looks to it like a branch that writes nothing, and the alias recorded before the
+branch survived it:
+
+```python
+if m.include_gusset:                  wp24 = wp9.union(wp23)
+    self.model = self.model.union(gusset)
+self.model = self.model.edges(...)    wp25 = wp9.edges(...)   # gusset gone
+                   .chamfer(...)
+```
+
+The chamfer reads the model as it stood before the gusset was unioned in, so the
+gusset is discarded. One corpus program lost 408 mm³ and 5 faces this way.
+`_assigned_state_keys` now collects the dotted targets a block writes, and `for`,
+`while` and `if` drop those aliases before lowering the block.
+`evals/cc_for/cases/attribute_state_across_branch.py` covers it.
+
+Between them the two changes alter 15 of the 5,000 canonical programs, and the
+three that were building wrong parts now round-trip exactly under both
+placements. Note that defect 3 above is *not* subsumed: it propagates across an
+opaque call such as `self.build()` rather than across a branch, which gives this
+analysis nothing to key on.
 
 ### Two limits left in place
 

@@ -36,7 +36,7 @@ the **canonical** code, and the **solids** both produce.
 | `source_executes` / `canonical_executes` | Both build a valid shape. |
 | `source_deterministic` | Does the source program build the same solid twice? |
 | `topology_identical` | Solids, shells, faces, wires, edges, vertices, face/edge type histograms, volume, area, bounding box, centre of mass. |
-| `shape_identical` | Voxel IoU ≈ 1 and Chamfer ≈ 0 after normalization. |
+| `shape_identical` | Voxel IoU ≈ 1 and Chamfer ≈ 0 after normalization. Skippable with `--no-mesh-comparison`, which is what makes a corpus-scale geometry run affordable. |
 | `prefixes_execute` | Every emitted action prefix runs on its own. |
 | `quantization_commutes` | Binarizing source and canonical gives the same solid. |
 | `quantized_shape_close` | The canonical program loses no more shape to binarization than the source does. |
@@ -57,6 +57,24 @@ range of behaviour:
   outcome for a program with a single feature, which is why it is reported
   rather than gated; see the note on what the layout gate cannot see in
   [`docs/cc_step_canonicalization.md`](../../docs/cc_step_canonicalization.md).
+
+## Running the geometry gates over the whole corpus
+
+The mesh comparison is the expensive gate; topology counts, mass properties and
+the bounding box already separate two different solids. Dropping it turns the
+5,000-program geometry run from impractical into an overnight-free afternoon:
+
+```bash
+PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval \
+    --corpus demo --parameter-placement late \
+    --no-mesh-comparison --no-quantization --no-perturbations --no-prefixes \
+    --workers 4 --report /tmp/demo-geometry.json
+```
+
+Three of the defects recorded in
+[`../../docs/cc_for_eval_suite.md`](../../docs/cc_for_eval_suite.md) were found
+this way and by nothing else: each one produces a canonical program that runs,
+passes every structural gate, and builds a different part.
 
 ## Attribution
 

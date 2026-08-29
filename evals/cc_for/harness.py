@@ -274,6 +274,7 @@ def evaluate_program(
     result_name: str = "result",
     run_geometry: bool = True,
     run_prefixes: bool = True,
+    run_sampled_shape: bool = True,
     run_quantization: bool = True,
     run_perturbations: bool = True,
     max_perturbations: int = DEFAULT_MAX_PERTURBATIONS,
@@ -669,7 +670,14 @@ def evaluate_program(
             "max_chamfer": limit,
         }
 
-    gates.append(_run_gate("shape_identical", _shape_identical))
+    if run_sampled_shape:
+        gates.append(_run_gate("shape_identical", _shape_identical))
+    else:
+        # Topology, mass properties and the bounding box already separate two
+        # different solids; the mesh comparison is what makes a corpus-scale run
+        # expensive, so it can be dropped when the question is only whether the
+        # canonical program builds the source part.
+        gates.append(_skipped("shape_identical", "mesh comparison disabled"))
 
     # --- action prefixes --------------------------------------------------
     if run_prefixes:
