@@ -1684,6 +1684,32 @@ _GEOMETRY_ATTRIBUTE_HINTS = {
 }
 
 
+def _assigned_state_keys(node: ast.AST) -> set[str]:
+    """Attribute targets a block writes, as dotted state keys.
+
+    ``_assigned_names`` sees only bare ``Name`` targets, so a branch that writes
+    ``self.model`` looks to it like a branch that writes nothing.  The lowerer
+    aliases such a key to a ``wpN``, and an alias that survives a branch which
+    rebinds it points at the value from before the branch.
+    """
+
+    keys: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        targets: list[ast.AST] = []
+        if isinstance(child, ast.Assign):
+            targets = list(child.targets)
+        elif isinstance(child, (ast.AnnAssign, ast.AugAssign, ast.For, ast.AsyncFor)):
+            targets = [child.target]
+        for target in targets:
+            if isinstance(target, ast.Attribute):
+                key = _state_key(target)
+                if key is not None:
+                    keys.add(key)
+    return keys
+
+
 def _state_key(node: ast.AST) -> str | None:
     if isinstance(node, ast.Name):
         return node.id
@@ -2168,7 +2194,22 @@ class _WorkplaneLowerer:
                     elif name in geometry_carried and name not in dynamic:
                         dynamic[name] = self._state_name(name)
 
+                # An attribute target such as ``self.model`` is invisible to
+                # ``_assigned_names``, so a branch that rebinds one leaves its
+                # alias in place and every later read still points at the value
+                # from before the branch.
+                for key in _assigned_state_keys(stmt):
+                    aliases.pop(key, None)
+                    dynamic.pop(key, None)
                 stmt.iter = _rewrite_loads(stmt.iter, aliases)
+                # The loop rebinds its target every iteration, so any alias
+                # recorded for that name earlier in the block is stale: rewriting
+                # a body read of it to the old ``wpN`` would union the same piece
+                # each pass instead of the one the loop is on.  Clearing has to
+                # follow the iterable, which is evaluated before the first bind.
+                for name in _target_names(stmt.target):
+                    aliases.pop(name, None)
+                    dynamic.pop(name, None)
                 stmt.body, body_aliases, body_dynamic = self._lower_block(
                     stmt.body,
                     aliases,
@@ -2212,6 +2253,13 @@ class _WorkplaneLowerer:
                     - set(aliases)
                 ):
                     dynamic.setdefault(name, self._state_name(name))
+                # An attribute target such as ``self.model`` is invisible to
+                # ``_assigned_names``, so a branch that rebinds one leaves its
+                # alias in place and every later read still points at the value
+                # from before the branch.
+                for key in _assigned_state_keys(stmt):
+                    aliases.pop(key, None)
+                    dynamic.pop(key, None)
                 stmt.test = _rewrite_loads(stmt.test, aliases)
                 stmt.body, _, _ = self._lower_block(
                     stmt.body,
@@ -2237,6 +2285,13 @@ class _WorkplaneLowerer:
                     initializer = self._materialize_alias(name, aliases, dynamic)
                     if initializer is not None:
                         output.append(ast.copy_location(initializer, stmt))
+                # An attribute target such as ``self.model`` is invisible to
+                # ``_assigned_names``, so a branch that rebinds one leaves its
+                # alias in place and every later read still points at the value
+                # from before the branch.
+                for key in _assigned_state_keys(stmt):
+                    aliases.pop(key, None)
+                    dynamic.pop(key, None)
                 stmt.test = _rewrite_loads(stmt.test, aliases)
                 stmt.body, body_aliases, body_dynamic = self._lower_block(
                     stmt.body,
