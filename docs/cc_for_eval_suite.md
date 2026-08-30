@@ -28,7 +28,7 @@ CadQuery to canonical code. User-defined parameter containers and opaque nested
 builder chains remain representation-coverage work, not executable-correctness
 failures.
 
-A later CC-step verification pass then found five more, recorded in
+A later CC-step verification pass then found seven more, recorded in
 [a second section below](#a-second-pass-what-the-cc-step-verification-found) --
 three of them silent geometry losses that only a corpus-scale solid comparison
 could see. Those are fixed too, and the two a structural scan can see are now
@@ -228,11 +228,12 @@ contract's intent.
 
 ## A second pass: what the CC-step verification found
 
-Five further defects, found by running CC-step over the same 5,000 programs, by
+Seven further defects, found by running CC-step over the same 5,000 programs, by
 hand-written probes around loops and parameter placement, and by promoting the
 source-versus-canonical solid comparison from a sample to the whole corpus. All
-five predate CC-step and affect both representations; all five are fixed on this
-branch, with regression cases in `evals/cc_for/cases/`.
+seven predate CC-step and affect both representations; all seven are fixed, with
+regression cases in `evals/cc_for/cases/`. Two of them only became visible once
+the correctness fixes above cleared the noisier failures out of the way.
 
 ### 6. A `while` loop's geometry accumulator is never written back
 
@@ -346,6 +347,48 @@ three that were building wrong parts now round-trip exactly under both
 placements. Note that defect 3 above is *not* subsumed: it propagates across an
 opaque call such as `self.build()` rather than across a branch, which gives this
 analysis nothing to key on.
+
+### 11. A loop body's alias escaped the loop
+
+Found by re-running the corpus-scale solid comparison after the correctness
+branch landed, which cleared the noisier failures and left this one visible. The
+loop body binds a name and something after the loop reads it; exporting the
+body's alias makes that read resolve to a `wpN` that exists only if the loop ran:
+
+```python
+# source                              # canonical, before the fix
+def add_ribs(self, solid):            def add_ribs(self, solid):
+    face = solid.faces(">Z")              wp7 = solid.faces(">Z")
+    for i in range(num_ribs):             for i in range(num_ribs):
+        solid = face...extrude()              wp9 = wp8.extrude(...)
+    return solid                              solid = wp9
+                                          return wp9   # unbound at num_ribs = 0
+```
+
+A geometry name the body binds *and* something after the loop reads now gets a
+stable runtime name, so the body writes through it and the later read uses the
+source's own name — bound exactly when the source would have bound it. Scoping it
+to names that are actually read afterwards matters: the blanket version moved 479
+of the 5,000 outputs and broke two programs, this one moves 6 and breaks none.
+`evals/cc_for/cases/loop_result_returned_after_loop.py` covers it.
+
+### 12. A rebound namespace field was flattened at its reads
+
+`Measures(..., radial_offset=None)`, filled in once the other fields are known, is
+a real idiom:
+
+```python
+m.lid_fixer.radial_offset = outer_radius - 0.5 * m.rim_radial_thickness
+...polarArray(radius=m.lid_fixer.radial_offset, ...)
+```
+
+Flattening rewrote the read to `lid_fixer_radial_offset`, which still held the
+`None` placeholder — the write went to the object, the read did not, and
+`polarArray` got `None` for its radius. A field that appears as an
+attribute-store target anywhere in the module is no longer flattened at its
+reads; it is still exposed as a named parameter and still passed to the
+reconstruction, only the read stays on the object. 1 of the 5,000.
+`evals/cc_for/cases/namespace_field_filled_in_later.py` covers it.
 
 ### What the corpus-scale solid comparison says once it is finished
 
@@ -491,7 +534,7 @@ canonicalization.
 4. A fluent chain in a `for` header, the one contract gap the converter still
    reports on itself.
 
-Defects 6-10 from the second pass are fixed; the two a structural scan can see
+Defects 6-12 from the second pass are fixed; the two a structural scan can see
 run corpus-wide as `loop_bindings_preserved` and `actions_reassemble`, and
 `--no-mesh-comparison` makes item 3 above practical -- it is how three of those
 five were found.
