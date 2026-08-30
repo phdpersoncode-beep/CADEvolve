@@ -432,6 +432,159 @@ result = accumulator
         validation = validate_round_trip(source, converted.code)
         self.assertTrue(validation.success, validation.to_dict())
 
+    def test_while_carried_geometry_accumulator_is_written_back(self) -> None:
+        """A ``while`` carries geometry the same way a ``for`` does.
+
+        Without the stable runtime name, the body's ``accumulator = ...`` is
+        recorded as an alias and never emitted: the next iteration and the code
+        after the loop both still read the ``None`` initializer, so the canonical
+        program runs, keeps the structural contract, and builds nothing.
+        """
+
+        source = """
+import cadquery as cq
+count = 3
+spacing = 3
+accumulator = None
+index = 0
+while index < count:
+    piece = cq.Workplane('XY').box(1, 1, 1).translate((index * spacing, 0, 0))
+    accumulator = piece if accumulator is None else accumulator.union(piece)
+    index = index + 1
+result = accumulator
+"""
+        for placement in ("preamble", "late"):
+            with self.subTest(placement=placement):
+                converted = canonicalize_code(
+                    source, CCForConfig(parameter_placement=placement)
+                )
+                self.assertRegex(converted.code, r"accumulator = wp\d+")
+                validation = validate_round_trip(source, converted.code)
+                self.assertTrue(validation.success, validation.to_dict())
+
+    def test_loop_target_clears_a_stale_geometry_alias(self) -> None:
+        """A second loop must iterate over its own target, not the first's alias.
+
+        Inside a ``def`` the renamer leaves locals alone, so one name can be both
+        an assignment target in one loop and the iteration variable of the next.
+        The alias from the first has to go, or every pass unions the same piece.
+        """
+
+        source = """
+import cadquery as cq
+size = 40.0
+thickness = 4.0
+stud = 4.0
+pitch = 12.0
+
+def build():
+    plate = cq.Workplane('XY').box(size, size, thickness)
+    studs = []
+    for index in range(3):
+        stud_solid = cq.Workplane('XY').box(stud, stud, 6.0).translate((index * pitch - pitch, 0, thickness / 2))
+        studs.append(stud_solid)
+    for stud_solid in studs:
+        plate = plate.union(stud_solid)
+    return plate
+result = build()
+"""
+        for placement in ("preamble", "late"):
+            with self.subTest(placement=placement):
+                converted = canonicalize_code(
+                    source, CCForConfig(parameter_placement=placement)
+                )
+                self.assertIn("union(stud_solid)", converted.code)
+                validation = validate_round_trip(source, converted.code)
+                self.assertTrue(validation.success, validation.to_dict())
+
+    def test_attribute_state_is_reread_after_a_branch_rebinds_it(self) -> None:
+        """``self.model`` written inside an ``if`` invalidates its alias.
+
+        A name-based analysis cannot see an attribute target, so without this the
+        step after the branch reads the model as it stood before the branch and
+        the conditional feature is silently dropped.
+        """
+
+        source = """
+import cadquery as cq
+width = 40.0
+thickness = 6.0
+boss = 8.0
+add_boss = True
+
+class Part:
+    def __init__(self):
+        self.model = cq.Workplane('XY').box(width, width, thickness)
+        if add_boss:
+            self.model = self.model.faces('>Z').workplane().circle(boss).extrude(5.0)
+        self.model = self.model.edges('|Z').chamfer(1.0)
+result = Part().model
+"""
+        for placement in ("preamble", "late"):
+            with self.subTest(placement=placement):
+                converted = canonicalize_code(
+                    source, CCForConfig(parameter_placement=placement)
+                )
+                validation = validate_round_trip(source, converted.code)
+                self.assertTrue(validation.success, validation.to_dict())
+
+    def test_module_geometry_read_in_a_helper_keeps_its_binding(self) -> None:
+        """A ``def`` resolves a module-level name at call time, not at lowering.
+
+        Rewriting the module-level reads to the ``wpN`` is right; dropping the
+        assignment with them is not, because the helper's read has nothing left
+        to resolve against.
+        """
+
+        source = """
+import cadquery as cq
+radius = 60.0
+span = 70.0
+width = 14.0
+height = 18.0
+sweep_path = cq.Workplane('XY').radiusArc((span, 0.0), radius).wire()
+body = cq.Workplane('XY').transformed(rotate=(90, 0, 0)).rect(width, height).sweep(sweep_path, transition='round')
+
+def groove(offset):
+    return cq.Workplane('XY').transformed(rotate=(90, 0, 0)).rect(5.0, 6.0).translate((-offset, 0, 0)).sweep(sweep_path, transition='round')
+result = body.cut(groove(3.0))
+"""
+        for placement in ("preamble", "late"):
+            with self.subTest(placement=placement):
+                converted = canonicalize_code(
+                    source, CCForConfig(parameter_placement=placement)
+                )
+                self.assertRegex(converted.code, r"sweep_path = wp\d+")
+                validation = validate_round_trip(source, converted.code)
+                self.assertTrue(validation.success, validation.to_dict())
+
+    def test_materializing_for_a_helper_never_duplicates_result(self) -> None:
+        """The result name is the one binding materialization must not restore.
+
+        A method that reads ``result`` would otherwise get its own top-level
+        ``result = wpN`` alongside the terminal one, and the contract allows
+        exactly one.
+        """
+
+        source = """
+import cadquery as cq
+width = 40.0
+thickness = 6.0
+
+class Part:
+    def __init__(self):
+        self.model = result
+part_holder = None
+result = cq.Workplane('XY').box(width, width, thickness)
+result = result.edges('|Z').fillet(1.0)
+"""
+        for placement in ("preamble", "late"):
+            with self.subTest(placement=placement):
+                converted = canonicalize_code(
+                    source, CCForConfig(parameter_placement=placement)
+                )
+                self.assertEqual(validate_structure(converted.code), [])
+
     def test_user_examples_survive_symbolic_numeric_binarization(self) -> None:
         for name in (
             "mounting_base_with_boss.py",

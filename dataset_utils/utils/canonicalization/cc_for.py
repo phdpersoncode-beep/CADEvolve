@@ -1265,6 +1265,30 @@ def _split_module_header(
     return docstrings, imports, body
 
 
+def _rebound_names(body: Sequence[ast.stmt]) -> set[str]:
+    """Names more than one top-level statement binds, so no parameter may cross.
+
+    Reaching-definition renaming versions the ordinary case, but a name a loop or
+    a branch also writes has to keep one stable binding, so both definitions
+    survive into this stage.  Moving the plain one is then unsound in either
+    direction: CC-for would hoist an accumulator's initializer above the loop that
+    updates it, and CC-step would sink it below, and both read a value the source
+    never produced.  Excluding it here rules out both, and anything derived from
+    it follows through the ``loads & local_defs <= movable_names`` test.
+
+    A ``global`` declaration counts as a binding: the module-level name is
+    reachable from a call this analysis cannot see into.
+    """
+
+    counts: Counter[str] = Counter()
+    for stmt in body:
+        counts.update(_assigned_names(stmt))
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Global):
+                counts.update(node.names)
+    return {name for name, count in counts.items() if count > 1}
+
+
 def _movable_parameter_indices(
     body: Sequence[ast.stmt],
     geometry: set[str],
@@ -1278,10 +1302,11 @@ def _movable_parameter_indices(
 
     A statement qualifies when it binds one name to a pure data expression that
     reads no geometry, no control-flow-mutated state, and no name that itself had
-    to stay put.  The namespace object flattening rebuilds from the parameters it
-    just exposed counts too: it holds nothing but those keywords, so it travels
-    with them.  Both placement strategies classify from this one predicate, so
-    CC-for and CC-step always treat the same statements as parameters.
+    to stay put, and when nothing else in the module binds the name it defines.
+    The namespace object flattening rebuilds from the parameters it just exposed
+    counts too: it holds nothing but those keywords, so it travels with them.
+    Both placement strategies classify from this one predicate, so CC-for and
+    CC-step always treat the same statements as parameters.
     """
 
     constructors = constructors or set()
@@ -1291,12 +1316,15 @@ def _movable_parameter_indices(
         for stmt in body
         if (name := _simple_assignment_name(stmt)) is not None
     }
+    rebound = _rebound_names(body)
     movable_names: set[str] = set()
     movable: list[int] = []
     for index, stmt in enumerate(body):
         name = _simple_assignment_name(stmt)
         value = _assignment_value(stmt)
         if name is None or value is None or name == result_name or name in geometry:
+            continue
+        if name in rebound:
             continue
         loads = _loaded_names(value)
         is_data = _is_pure_data_expression(
@@ -1408,16 +1436,7 @@ def _sink_parameter_assignments(
     """
 
     context = _parameter_context(tree, result_name)
-    body, candidates = context.body, context.movable
-
-    # Repositioning one of several definitions of a name would change which one
-    # reaches a use, so a redefined name stays exactly where the source put it.
-    definition_counts = Counter(_names_of(body))
-    movable = [
-        index
-        for index in candidates
-        if definition_counts[_simple_assignment_name(body[index])] == 1
-    ]
+    body, movable = context.body, context.movable
     movable_set = set(movable)
     name_of = {index: _simple_assignment_name(body[index]) for index in movable}
 
@@ -1681,6 +1700,32 @@ _GEOMETRY_ATTRIBUTE_HINTS = {
 }
 
 
+def _assigned_state_keys(node: ast.AST) -> set[str]:
+    """Attribute targets a block writes, as dotted state keys.
+
+    ``_assigned_names`` sees only bare ``Name`` targets, so a branch that writes
+    ``self.model`` looks to it like a branch that writes nothing.  The lowerer
+    aliases such a key to a ``wpN``, and an alias that survives a branch which
+    rebinds it points at the value from before the branch.
+    """
+
+    keys: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        targets: list[ast.AST] = []
+        if isinstance(child, ast.Assign):
+            targets = list(child.targets)
+        elif isinstance(child, (ast.AnnAssign, ast.AugAssign, ast.For, ast.AsyncFor)):
+            targets = [child.target]
+        for target in targets:
+            if isinstance(target, ast.Attribute):
+                key = _state_key(target)
+                if key is not None:
+                    keys.add(key)
+    return keys
+
+
 def _state_key(node: ast.AST) -> str | None:
     if isinstance(node, ast.Name):
         return node.id
@@ -1723,6 +1768,32 @@ def _geometry_factory_names(tree: ast.AST) -> set[str]:
     return names
 
 
+def _nested_scope_reads(tree: ast.AST) -> set[str]:
+    """Names read inside a ``def``, ``class`` or ``lambda`` body.
+
+    Lowering rewrites a module-level geometry name to the ``wpN`` that carries
+    its value and drops the original assignment.  A nested scope resolves such a
+    name at call time, against the module globals, where the dropped assignment
+    was the only binding -- so the alias has to be materialized as well.
+    """
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bodies: list[ast.AST] = list(node.body)
+        elif isinstance(node, ast.Lambda):
+            bodies = [node.body]
+        else:
+            continue
+        for body in bodies:
+            names.update(
+                child.id
+                for child in ast.walk(body)
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+            )
+    return names
+
+
 class _WorkplaneLowerer:
     def __init__(self, tree: ast.Module, report: CCForReport, result_name: str) -> None:
         self.report = report
@@ -1732,6 +1803,7 @@ class _WorkplaneLowerer:
         self.helper_index = 0
         self.saw_result = False
         self.geometry_factories = _geometry_factory_names(tree)
+        self.nested_scope_reads = _nested_scope_reads(tree)
         self.global_result_state: str | None = None
         if any(
             isinstance(node, ast.Global) and result_name in node.names
@@ -2159,6 +2231,17 @@ class _WorkplaneLowerer:
                             output.append(_assign(dynamic[name], value, stmt))
                         else:
                             aliases[name] = value.id
+                            if (
+                                name in self.nested_scope_reads
+                                and name != self.result_name
+                            ):
+                                # A `def` reads this name at call time, against a
+                                # binding the alias would otherwise remove.  The
+                                # result name is excluded: only its terminal
+                                # assignment may appear, and the loop-carried
+                                # state name already carries it into a nested
+                                # scope.
+                                output.append(_assign(name, value, stmt))
                         if tracks_result and name == self.result_name:
                             self.saw_result = True
                         continue
@@ -2236,9 +2319,24 @@ class _WorkplaneLowerer:
                     elif name in geometry_carried and name not in dynamic:
                         dynamic[name] = self._state_name(name)
 
+                # An attribute target such as ``self.model`` is invisible to
+                # ``_assigned_names``, so a branch that rebinds one leaves its
+                # alias in place and every later read still points at the value
+                # from before the branch.
+                for key in _assigned_state_keys(stmt):
+                    aliases.pop(key, None)
+                    dynamic.pop(key, None)
                 stmt.iter = _rewrite_loads(
                     stmt.iter, self._load_mapping(aliases, dynamic)
                 )
+                # The loop rebinds its target every iteration, so any alias
+                # recorded for that name earlier in the block is stale: rewriting
+                # a body read of it to the old ``wpN`` would union the same piece
+                # each pass instead of the one the loop is on.  Clearing has to
+                # follow the iterable, which is evaluated before the first bind.
+                for name in _target_names(stmt.target):
+                    aliases.pop(name, None)
+                    dynamic.pop(name, None)
                 stmt.body, body_aliases, body_dynamic = self._lower_block(
                     stmt.body,
                     aliases,
@@ -2268,6 +2366,27 @@ class _WorkplaneLowerer:
                     initializer = self._materialize_alias(name, aliases, dynamic)
                     if initializer is not None:
                         output.append(ast.copy_location(initializer, stmt))
+                # A ``while`` carries geometry across iterations exactly as a
+                # ``for`` does, so its accumulators need the same stable runtime
+                # name.  Without this the body's ``acc = ...`` is recorded as an
+                # alias and never written back: the next iteration and the code
+                # after the loop both still read the initializer, and the part
+                # loses every body the loop built without raising anything.
+                carried = _assigned_names(
+                    ast.Module(body=stmt.body, type_ignores=[])
+                ) & _loads_before_definition(stmt.body)
+                for name in sorted(
+                    (carried & self._geometry_assignment_candidates(stmt.body))
+                    - set(aliases)
+                ):
+                    dynamic.setdefault(name, self._state_name(name))
+                # An attribute target such as ``self.model`` is invisible to
+                # ``_assigned_names``, so a branch that rebinds one leaves its
+                # alias in place and every later read still points at the value
+                # from before the branch.
+                for key in _assigned_state_keys(stmt):
+                    aliases.pop(key, None)
+                    dynamic.pop(key, None)
                 stmt.test = _rewrite_loads(
                     stmt.test, self._load_mapping(aliases, dynamic)
                 )
@@ -2295,6 +2414,13 @@ class _WorkplaneLowerer:
                     initializer = self._materialize_alias(name, aliases, dynamic)
                     if initializer is not None:
                         output.append(ast.copy_location(initializer, stmt))
+                # An attribute target such as ``self.model`` is invisible to
+                # ``_assigned_names``, so a branch that rebinds one leaves its
+                # alias in place and every later read still points at the value
+                # from before the branch.
+                for key in _assigned_state_keys(stmt):
+                    aliases.pop(key, None)
+                    dynamic.pop(key, None)
                 stmt.test = _rewrite_loads(
                     stmt.test, self._load_mapping(aliases, dynamic)
                 )
@@ -2689,6 +2815,36 @@ def _decompose_late_actions(
     return header, groups
 
 
+def _opens_with_definition(code: str) -> bool:
+    """Whether ``code`` starts with the kind of statement unparsing spaces out."""
+
+    body = ast.parse(code).body
+    return bool(body) and isinstance(
+        body[0], (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    )
+
+
+def join_actions(actions: Sequence[CanonicalAction]) -> str:
+    """Reassemble the canonical program text from its actions.
+
+    A tree search over actions builds its program by concatenating them, so the
+    text it ends with has to be the text the converter emits -- otherwise an
+    exact-match score or a dedup hash sees two different programs.  Unparsing a
+    whole module puts a blank line before every top-level ``def`` or ``class``
+    that is not the first statement of the module; unparsing that statement as
+    its own action does not, because there it *is* first.  Restoring that one
+    separator is the whole difference.
+    """
+
+    chunks: list[str] = []
+    for index, action in enumerate(actions):
+        code = action.code
+        if index and _opens_with_definition(code):
+            code = "\n" + code
+        chunks.append(code)
+    return "\n".join(chunks).rstrip() + "\n"
+
+
 def decompose_actions(
     code: str,
     result_name: str = "result",
@@ -2733,5 +2889,6 @@ __all__ = [
     "ParameterPlacement",
     "canonicalize_code",
     "decompose_actions",
+    "join_actions",
     "validate_structure",
 ]

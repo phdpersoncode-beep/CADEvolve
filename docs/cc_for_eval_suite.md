@@ -6,7 +6,7 @@ branch `agent/cc-for-canonicalization`) using the suite in
 [`evals/cc_for/`](../evals/cc_for/README.md).
 
 Corpus: the 5,000 checked-in Zero-to-CAD programs in
-`demo_data/zero_to_cad_5k/`, plus 22 hand-written edge cases in
+`demo_data/zero_to_cad_5k/`, plus the hand-written edge cases in
 `evals/cc_for/cases/`. Environment: CadQuery 2.5.2 / OCP 7.7.2, Python 3.11.
 
 ## Current status
@@ -27,6 +27,12 @@ rather than a requirement: the converter's contract is one pass from source
 CadQuery to canonical code. User-defined parameter containers and opaque nested
 builder chains remain representation-coverage work, not executable-correctness
 failures.
+
+A later CC-step verification pass then found five more, recorded in
+[a second section below](#a-second-pass-what-the-cc-step-verification-found) --
+three of them silent geometry losses that only a corpus-scale solid comparison
+could see. Those are fixed too, and the two a structural scan can see are now
+gated corpus-wide.
 
 ## Headline
 
@@ -220,6 +226,175 @@ contract's intent.
   converter cannot tell that a user method returns geometry. Each is a modelling
   step that the action decomposition does not see.
 
+## A second pass: what the CC-step verification found
+
+Five further defects, found by running CC-step over the same 5,000 programs, by
+hand-written probes around loops and parameter placement, and by promoting the
+source-versus-canonical solid comparison from a sample to the whole corpus. All
+five predate CC-step and affect both representations; all five are fixed on this
+branch, with regression cases in `evals/cc_for/cases/`.
+
+### 6. A `while` loop's geometry accumulator is never written back
+
+`for` pre-declares a loop-carried geometry name so the body's assignment is
+emitted; `while` did not, so the assignment was recorded as an alias and dropped.
+
+```python
+# source
+pegs = None
+index = 0
+while index < peg_count:
+    peg = cq.Workplane("XY").center(...).circle(peg_radius).extrude(peg_height)
+    pegs = peg if pegs is None else pegs.union(peg)
+    index = index + 1
+result = base.union(pegs)
+
+# canonical, before the fix -- note that nothing assigns `pegs`
+while index < peg_count:
+    ...
+    if pegs is None:
+        wp8 = wp6
+    else:
+        wp7 = pegs.union(wp6)
+        wp8 = wp7
+    index = index + 1
+wp9 = wp2.union(pegs)          # pegs is still None: every peg is gone
+```
+
+The canonical program runs, keeps the structural contract, and builds the base
+with no pegs on it. 2/5,000 corpus programs match the pattern, and both lose
+geometry (one drops an entire internal lattice: volume 17,663 against 19,313).
+`evals/cc_for/cases/while_carried_union_accumulator.py` covers it, and a
+corpus-wide check — *is every name the source binds inside a loop body still
+bound inside a loop body?* — now reports 0/5,000.
+
+### 7. A parameter moved across the statement that rebinds it
+
+A name a loop or a branch also writes keeps one stable binding through renaming,
+so both definitions reach the placement stage. The movability predicate looked at
+what a statement *read*, not at what it *bound*, so the plain definition counted
+as a parameter and moved — CC-for above the loop, CC-step below it.
+
+```python
+tallest = 0.5
+for rib_height in rib_heights:
+    if rib_height > tall_threshold:
+        tallest = rib_height
+result = plate.faces(">Z").workplane().circle(6.0).extrude(tallest)
+```
+
+Under CC-step the initializer sank below the loop and the boss came out 0.5 tall
+instead of 6.0; the mirror program, with the reset *after* the loop, catches
+CC-for the same way. Excluding rebound names fixes both and changes 72/5,000
+CC-for and 61/5,000 CC-step outputs, all of them corrections. Covered by
+`conditional_loop_accumulator.py` and `late_reinitialized_accumulator.py`.
+
+### 8. Actions did not reassemble into the canonical program
+
+Concatenating the emitted actions is how a tree search builds its program, so the
+concatenation has to be the text the converter emits. Unparsing a module spaces a
+top-level `def` or `class` out from the statement before it; unparsing that
+statement alone as its own action does not, so a plain `"\n".join` of the actions
+differed from the canonical code for **798/5,000** programs under both
+placements. `join_actions` restores the separator and now reproduces the
+canonical text for 5,000/5,000.
+
+### 9. A `for` target kept an alias from an earlier loop
+
+Found by running the source-versus-canonical solid comparison over all 5,000
+programs rather than a sample. Inside a `def` the renamer leaves locals alone,
+so one name can be both an assignment target in one loop and the iteration
+variable of the next. The lowerer aliased the first to its `wpN` and never
+cleared it:
+
+```python
+# source                              # canonical, before the fix
+for x, y in rib_coords:               for x, y in rib_coords:
+    rib = ...build...                     wp17 = ...build...
+    ribs.append(rib)                      ribs.append(wp17)
+for rib in ribs:                      for rib in ribs:
+    base = base.union(rib)                wp18 = base.union(wp17)
+```
+
+The union runs four times over the last rib. One Zero-to-CAD program hit it and
+came out 432 mm³ light with 15 faces missing, while running cleanly and keeping
+the structural contract. A `for` target now clears its alias, after the iterable
+is rewritten, since the iterable is evaluated before the first bind.
+`evals/cc_for/cases/loop_target_reuses_geometry_name.py` covers it.
+
+### 10. An attribute target rebound inside a branch kept its alias
+
+`_assigned_names` collects `Name` stores, so a branch that writes `self.model`
+looks to it like a branch that writes nothing, and the alias recorded before the
+branch survived it:
+
+```python
+if m.include_gusset:                  wp24 = wp9.union(wp23)
+    self.model = self.model.union(gusset)
+self.model = self.model.edges(...)    wp25 = wp9.edges(...)   # gusset gone
+                   .chamfer(...)
+```
+
+The chamfer reads the model as it stood before the gusset was unioned in, so the
+gusset is discarded. One corpus program lost 408 mm³ and 5 faces this way.
+`_assigned_state_keys` now collects the dotted targets a block writes, and `for`,
+`while` and `if` drop those aliases before lowering the block.
+`evals/cc_for/cases/attribute_state_across_branch.py` covers it.
+
+Between them the two changes alter 15 of the 5,000 canonical programs, and the
+three that were building wrong parts now round-trip exactly under both
+placements. Note that defect 3 above is *not* subsumed: it propagates across an
+opaque call such as `self.build()` rather than across a branch, which gives this
+analysis nothing to key on.
+
+### What the corpus-scale solid comparison says once it is finished
+
+Running it over all 5,000 programs, after the five fixes:
+
+| outcome                                                | programs |
+| ------------------------------------------------------ | -------- |
+| source and canonical build an identical solid           | 4,931    |
+| canonical program raises rather than building           | 15       |
+| source is not reproducible, so nothing can be compared  | 33       |
+| source does not build at all                            | 18       |
+| source crashes OpenCascade                              | 3        |
+
+Of the 4,946 whose source builds reproducibly, 4,931 convert to an identical
+solid and 15 raise. **None builds a different solid silently** — which is the
+claim that matters, because a silent difference is the only failure mode nothing
+else in the suite can see.
+
+Getting to that number needed care. A first pass reported 30 divergences and 33
+worker deaths; re-checking each one individually collapsed those to 5 candidates
+and 28 healthy programs, because one segfaulting program takes its whole batch's
+futures with it. Running the source of each remaining candidate in several fresh
+interpreters then showed all five to be unstable sources: `df224b5a` alternates
+between 72,419 mm³ / 173 faces and 74,112 mm³ / 156 faces from run to run,
+canonical or not. A two-run determinism check is not enough to catch that; a
+five-run one across fresh processes is.
+
+The 15 that raise break down as six `self` attributes copy-propagated across an
+opaque builder call (defect 3), five names the SSA pass renamed on one definition
+but not another (defects 1 and 2), and four single instances — an
+`UnboundLocalError` on a generated `wpN`, a `TypeError` on `None`, a `ValueError`
+from an empty selector, and a `NameError` on a list built inside control flow —
+not yet traced to a family.
+
+### Two limits left in place
+
+- **A fluent chain in a `for` header is not lowered.** The loop body and the
+  header's names are rewritten, `part.faces('>Z').vals()` in
+  `for face in part.faces('>Z').vals():` is not. Self-reported by
+  `validate_structure`, like the `try`/`except` gap above, and absent from the
+  demo corpus. `evals/cc_for/cases/loop_over_geometry_iterable.py` keeps it
+  visible.
+- **A value derived from a rebound name cannot sink either.** Excluding rebound
+  names also excludes everything derived from them, so under CC-step such a chain
+  stays where the source put it and `parameters_placed_late` reports it — 2/5,000
+  programs. Sinking it safely needs a per-parameter bound on how far it may
+  travel rather than a yes/no predicate, which is a change to the representation
+  rather than a fix to it.
+
 ## Why the existing validation did not catch these
 
 The PR reports 5,000/5,000 passing and 32/32 on the geometry gates. Both numbers
@@ -313,6 +488,13 @@ canonicalization.
    visible actions.
 3. Corpus-scale geometry validation paired with the reproducibility check,
    because roughly 1% of the corpus cannot serve as its own stable baseline.
+4. A fluent chain in a `for` header, the one contract gap the converter still
+   reports on itself.
+
+Defects 6-10 from the second pass are fixed; the two a structural scan can see
+run corpus-wide as `loop_bindings_preserved` and `actions_reassemble`, and
+`--no-mesh-comparison` makes item 3 above practical -- it is how three of those
+five were found.
 
 The first two are representation-coverage choices. They do not currently make
 the emitted programs execute differently from their sources.

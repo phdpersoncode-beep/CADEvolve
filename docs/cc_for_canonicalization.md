@@ -27,7 +27,9 @@ There is exactly one terminal `result = ...` assignment. For Step-ToCAD action
 decomposition, the parameter preamble is one action, every other top-level AST
 statement is one action, and the terminal `result` alias is folded into the preceding
 modeling action. Under CC-step only the docstring and imports form a standalone
-header; each parameter group joins the modeling action it was placed for.
+header; each parameter group joins the modeling action it was placed for. Either way
+`join_actions` reassembles the actions into the canonical program byte for byte, so
+the program a search ends with is the program the converter emits.
 
 ## Pipeline
 
@@ -45,11 +47,12 @@ The structural pipeline runs in this order:
 5. Apply deterministic reaching-definition renaming. Every definition of a repeated
    name receives a suffix, including the first definition.
 6. Hoist pure, CAD-independent assignments into a dependency-safe parameter preamble.
-   Loop-local and loop-mutated values stay with their loop in preserve mode. Under
-   `parameter_placement: late` this step sinks each parameter to the latest position
-   that still precedes every read of it, producing CC-step. It runs before lowering,
-   so a group lands above a whole fluent chain rather than inside the run of `wpN`
-   steps that chain becomes.
+   Loop-local and loop-mutated values stay with their loop in preserve mode, and so
+   does any name a second statement binds -- moving it would carry it across the
+   loop or branch that rebinds it. Under `parameter_placement: late` this step sinks
+   each parameter to the latest position that still precedes every read of it,
+   producing CC-step. It runs before lowering, so a group lands above a whole fluent
+   chain rather than inside the run of `wpN` steps that chain becomes.
 7. Lower CadQuery Workplane, Sketch, and shape-factory chains without executing them,
    including chains inside helper functions and class methods. `cq.Plane`,
    `cq.Vector`, trigonometry, and other parameter expressions remain symbolic.

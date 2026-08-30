@@ -58,6 +58,8 @@ GATE_ORDER = (
     "loops_unrolled",
     "literals_stable",
     "chains_lowered",
+    "loop_bindings_preserved",
+    "actions_reassemble",
     "source_executes",
     "canonical_executes",
     "source_deterministic",
@@ -331,6 +333,11 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--no-geometry", action="store_true", help="AST gates only")
     parser.add_argument("--no-prefixes", action="store_true")
+    parser.add_argument(
+        "--no-mesh-comparison",
+        action="store_true",
+        help="skip shape_identical; topology and mass properties still run",
+    )
     parser.add_argument("--no-quantization", action="store_true")
     parser.add_argument("--no-perturbations", action="store_true")
     parser.add_argument(
@@ -375,6 +382,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "parameter_placement": args.parameter_placement,
         "run_geometry": not args.no_geometry,
         "run_prefixes": not args.no_prefixes,
+        "run_sampled_shape": not args.no_mesh_comparison,
         "run_quantization": not args.no_quantization,
         "run_perturbations": not args.no_perturbations,
         "voxel_resolution": args.voxel_resolution,

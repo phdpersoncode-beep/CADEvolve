@@ -15,7 +15,12 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
 
-from .cc_for import CanonicalizationResult, decompose_actions
+from .cc_for import (
+    CanonicalAction,
+    CanonicalizationResult,
+    decompose_actions,
+    join_actions,
+)
 
 
 @dataclass(frozen=True)
@@ -542,18 +547,20 @@ def validate_prefixes(
     if not actions:
         return PrefixValidation(success=False, checked_prefixes=0, error="no actions")
 
-    chunks: list[str] = []
+    chunks: list[CanonicalAction] = []
     checked = 0
     geometry_started = False
     for index, action in enumerate(actions):
-        chunks.append(action.code)
+        chunks.append(action)
         if action.kind == "preamble":
             continue
         try:
             geometry_started = geometry_started or _defines_geometry_state(
                 action.code, result_name
             )
-            namespace = execute_program("\n".join(chunks))
+            # Executing the prefix the way a tree search would build it: the
+            # program text after N actions, not a looser join of the same code.
+            namespace = execute_program(join_actions(chunks))
             latest = _latest_geometry(namespace, result_name)
             if geometry_started and latest is None:
                 raise ValueError("prefix did not expose a Workplane/Shape state")
