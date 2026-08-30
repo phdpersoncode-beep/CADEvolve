@@ -366,6 +366,15 @@ def _flatten_simple_namespaces(tree: ast.Module, report: CCForReport) -> ast.Mod
     reserved = _all_bound_names(tree)
     mappings: dict[str, dict[str, str]] = {}
     canonical_roots: dict[str, str] = {}
+    # A field the program later writes through the object -- ``m.f.radial_offset
+    # = ...`` filling in a ``None`` placeholder -- must keep reading through it.
+    # Flattening the read decouples it from the write, and the placeholder is
+    # what the modelling call gets.
+    rebound_fields = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store)
+    }
 
     def allocate(root: str, key: str, *, force_prefix: bool = False) -> str:
         candidate = f"{root}_{key}" if force_prefix else key
@@ -428,8 +437,11 @@ def _flatten_simple_namespaces(tree: ast.Module, report: CCForReport) -> ast.Mod
                 emitted.append(_assign(flattened, keyword.value, location))
             key_map[keyword.arg] = flattened
 
-        mappings[root] = key_map
-        report.flattened_namespaces[root] = dict(key_map)
+        readable = {
+            key: value for key, value in key_map.items() if key not in rebound_fields
+        }
+        mappings[root] = readable
+        report.flattened_namespaces[root] = dict(readable)
         reconstruction = _assign(
             root,
             ast.Call(
@@ -2201,7 +2213,7 @@ class _WorkplaneLowerer:
         output: list[ast.stmt] = []
         pending_invalidations: set[str] = set()
 
-        for stmt in statements:
+        for index, stmt in enumerate(statements):
             # An opaque method call in the previous statement may have rebound
             # receiver attributes.  Invalidate immediately before the next
             # statement reads them, while still allowing the call itself to use
@@ -2319,6 +2331,32 @@ class _WorkplaneLowerer:
                     elif name in geometry_carried and name not in dynamic:
                         dynamic[name] = self._state_name(name)
 
+                # A loop may run zero times, so an alias its body records cannot
+                # be exported: a read after the loop would resolve to a ``wpN``
+                # that was never assigned.  A geometry name the body binds and
+                # something after the loop reads gets a stable runtime name
+                # instead, so the body emits a real assignment and the later read
+                # uses the source's own name -- bound exactly when the source
+                # would have bound it.
+                later_reads: set[str] = set()
+                for following in statements[index + 1 :]:
+                    later_reads |= _loaded_names(following)
+                escaping: set[str] = set()
+                for name in sorted(
+                    self._geometry_assignment_candidates(stmt.body)
+                    & assigned
+                    & later_reads
+                ):
+                    if name in aliases:
+                        initializer = self._materialize_alias(
+                            name, aliases, dynamic
+                        )
+                        if initializer is not None:
+                            output.append(ast.copy_location(initializer, stmt))
+                    else:
+                        dynamic.setdefault(name, self._state_name(name))
+                    escaping.add(name)
+
                 # An attribute target such as ``self.model`` is invisible to
                 # ``_assigned_names``, so a branch that rebinds one leaves its
                 # alias in place and every later read still points at the value
@@ -2354,6 +2392,10 @@ class _WorkplaneLowerer:
                 for name in assigned:
                     if name in body_dynamic:
                         dynamic[name] = body_dynamic[name]
+                        aliases.pop(name, None)
+                    elif name in escaping:
+                        # The body binds this one through a stable name now, so
+                        # the read after the loop uses the source's own name.
                         aliases.pop(name, None)
                     elif name in body_aliases:
                         aliases[name] = body_aliases[name]

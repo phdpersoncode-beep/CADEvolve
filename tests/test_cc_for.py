@@ -585,6 +585,55 @@ result = result.edges('|Z').fillet(1.0)
                 )
                 self.assertEqual(validate_structure(converted.code), [])
 
+    def test_a_loop_body_alias_does_not_escape_the_loop(self) -> None:
+        """A loop can run zero times, so its body's `wpN` cannot be the binding.
+
+        The read after the loop has to resolve exactly when the source's would --
+        which for an empty range means the parameter the helper was handed.
+        """
+
+        source = """
+import cadquery as cq
+length = 60.0
+width = 40.0
+thickness = 6.0
+rib_count = 0
+
+def add_ribs(solid):
+    face = solid.faces('>Z')
+    for index in range(rib_count):
+        solid = face.workplane().center(index * 12.0, 0).rect(4.0, 4.0).extrude(5.0)
+    return solid
+result = add_ribs(cq.Workplane('XY').box(length, width, thickness))
+"""
+        for placement in ("preamble", "late"):
+            with self.subTest(placement=placement):
+                converted = canonicalize_code(
+                    source, CCForConfig(parameter_placement=placement)
+                )
+                self.assertNotRegex(converted.code, r"return wp\d+\n")
+                validation = validate_round_trip(source, converted.code)
+                self.assertTrue(validation.success, validation.to_dict())
+
+    def test_a_rebound_namespace_field_keeps_reading_through_the_object(self) -> None:
+        """Flattening a field the program writes back decouples write from read."""
+
+        source = """
+import cadquery as cq
+from types import SimpleNamespace as Measures
+m = Measures(diameter=80.0, thickness=6.0, rim=8.0, radius=None)
+m.radius = 0.5 * m.diameter - 0.5 * m.rim
+result = cq.Workplane('XY').circle(m.radius).extrude(m.thickness)
+"""
+        for placement in ("preamble", "late"):
+            with self.subTest(placement=placement):
+                converted = canonicalize_code(
+                    source, CCForConfig(parameter_placement=placement)
+                )
+                self.assertIn("m.radius", converted.code)
+                validation = validate_round_trip(source, converted.code)
+                self.assertTrue(validation.success, validation.to_dict())
+
     def test_user_examples_survive_symbolic_numeric_binarization(self) -> None:
         for name in (
             "mounting_base_with_boss.py",
