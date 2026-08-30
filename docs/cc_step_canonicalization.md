@@ -246,6 +246,32 @@ CC-step splits the snapshot into a mean of 4.00 parameter groups per program
 (median 4, max 12) against CC-for's single preamble. Parameter retention is
 0.9999 in both; design-parameter coverage is 0.995.
 
+Source-versus-canonical **solid** comparison over all 5,000 snapshot programs --
+the geometry check that had only ever run on a sample, made affordable by
+`--no-mesh-comparison`:
+
+| outcome                                                | programs |
+| ------------------------------------------------------ | -------- |
+| source and CC-step build an identical solid             | 4,931    |
+| CC-step program raises rather than building             | 15       |
+| source is not reproducible, so nothing can be compared  | 33       |
+| source does not build at all                            | 18       |
+| source crashes OpenCascade                              | 3        |
+
+Of the 4,946 programs whose source builds reproducibly, 4,931 convert to an
+identical solid and 15 raise; **none builds a different solid silently**. The 33
+unstable sources are the reproducibility floor the eval suite already documents --
+each gives two or more different solids across fresh processes, so its conversion
+cannot be held to it either way. Every candidate divergence was re-checked one
+program at a time, running the source in several fresh interpreters before
+calling a difference the converter's.
+
+The 15 that raise are the defect families recorded in
+[`cc_for_eval_suite.md`](cc_for_eval_suite.md): six are the `self` attribute
+copy-propagated across an opaque builder call, five are names the SSA pass
+renamed on one definition but not another, and four are single instances not yet
+traced.
+
 The 74 snapshot programs whose output this branch changes were re-run on their
 own under the full geometry gates: 74/74 pass under `preamble` and 73/74 under
 `late`, the exception being a program the legacy binarizer cannot round — its
