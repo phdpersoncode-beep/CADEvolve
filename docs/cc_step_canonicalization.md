@@ -238,8 +238,8 @@ placements, 2,082 loops preserved and 110,696 Workplane steps emitted:
 | `loops_preserved` / `literals_stable`           | 5000/5000  | 5000/5000 |
 | `loop_bindings_preserved`                       | 5000/5000  | 5000/5000 |
 | `actions_reassemble`                            | 5000/5000  | 5000/5000 |
-| `parameters_hoisted` / `parameters_placed_late` | 4993/5000  | 4998/5000 |
-| `parameters_preserved`                          | 4990/5000  | 4990/5000 |
+| `parameters_hoisted` / `parameters_placed_late` | 4992/5000  | 4997/5000 |
+| `parameters_preserved`                          | 4994/5000  | 4994/5000 |
 | `chains_lowered`                                | 4995/5000  | 4995/5000 |
 
 CC-step splits the snapshot into a mean of 4.00 parameter groups per program
@@ -252,25 +252,23 @@ the geometry check that had only ever run on a sample, made affordable by
 
 | outcome                                                | programs |
 | ------------------------------------------------------ | -------- |
-| source and CC-step build an identical solid             | 4,931    |
-| CC-step program raises rather than building             | 15       |
-| source is not reproducible, so nothing can be compared  | 33       |
+| source and CC-step build an identical solid             | 4,950    |
+| CC-step program raises rather than building             | 0        |
+| source is not reproducible, so nothing can be compared  | 28       |
 | source does not build at all                            | 18       |
-| source crashes OpenCascade                              | 3        |
+| source crashes or hangs OpenCascade                     | 4        |
 
-Of the 4,946 programs whose source builds reproducibly, 4,931 convert to an
-identical solid and 15 raise; **none builds a different solid silently**. The 33
-unstable sources are the reproducibility floor the eval suite already documents --
-each gives two or more different solids across fresh processes, so its conversion
-cannot be held to it either way. Every candidate divergence was re-checked one
-program at a time, running the source in several fresh interpreters before
-calling a difference the converter's.
+**Every one of the 4,950 programs whose source builds reproducibly converts to a
+program that builds the identical solid.** None raises, and none differs.
 
-The 15 that raise are the defect families recorded in
-[`cc_for_eval_suite.md`](cc_for_eval_suite.md): six are the `self` attribute
-copy-propagated across an opaque builder call, five are names the SSA pass
-renamed on one definition but not another, and four are single instances not yet
-traced.
+The other 50 cannot be compared to anything. 28 are the reproducibility floor the
+eval suite documents -- each gives two or more different solids across fresh
+interpreters, so its conversion cannot be held to it either way; 18 do not build
+at all; 4 take OpenCascade down or hang it. Every candidate divergence was
+re-checked one program at a time, running the source in several fresh
+interpreters before calling a difference the converter's, and every one of them
+turned out to be the source moving under the comparison rather than the
+conversion changing the part.
 
 The 74 snapshot programs whose output this branch changes were re-run on their
 own under the full geometry gates: 74/74 pass under `preamble` and 73/74 under

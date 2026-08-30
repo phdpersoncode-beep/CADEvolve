@@ -28,7 +28,7 @@ CadQuery to canonical code. User-defined parameter containers and opaque nested
 builder chains remain representation-coverage work, not executable-correctness
 failures.
 
-A later CC-step verification pass then found five more, recorded in
+A later CC-step verification pass then found seven more, recorded in
 [a second section below](#a-second-pass-what-the-cc-step-verification-found) --
 three of them silent geometry losses that only a corpus-scale solid comparison
 could see. Those are fixed too, and the two a structural scan can see are now
@@ -228,11 +228,12 @@ contract's intent.
 
 ## A second pass: what the CC-step verification found
 
-Five further defects, found by running CC-step over the same 5,000 programs, by
+Seven further defects, found by running CC-step over the same 5,000 programs, by
 hand-written probes around loops and parameter placement, and by promoting the
 source-versus-canonical solid comparison from a sample to the whole corpus. All
-five predate CC-step and affect both representations; all five are fixed on this
-branch, with regression cases in `evals/cc_for/cases/`.
+seven predate CC-step and affect both representations; all seven are fixed, with
+regression cases in `evals/cc_for/cases/`. Two of them only became visible once
+the correctness fixes above cleared the noisier failures out of the way.
 
 ### 6. A `while` loop's geometry accumulator is never written back
 
@@ -347,38 +348,80 @@ placements. Note that defect 3 above is *not* subsumed: it propagates across an
 opaque call such as `self.build()` rather than across a branch, which gives this
 analysis nothing to key on.
 
+### 11. A loop body's alias escaped the loop
+
+Found by re-running the corpus-scale solid comparison after the correctness
+branch landed, which cleared the noisier failures and left this one visible. The
+loop body binds a name and something after the loop reads it; exporting the
+body's alias makes that read resolve to a `wpN` that exists only if the loop ran:
+
+```python
+# source                              # canonical, before the fix
+def add_ribs(self, solid):            def add_ribs(self, solid):
+    face = solid.faces(">Z")              wp7 = solid.faces(">Z")
+    for i in range(num_ribs):             for i in range(num_ribs):
+        solid = face...extrude()              wp9 = wp8.extrude(...)
+    return solid                              solid = wp9
+                                          return wp9   # unbound at num_ribs = 0
+```
+
+A geometry name the body binds *and* something after the loop reads now gets a
+stable runtime name, so the body writes through it and the later read uses the
+source's own name — bound exactly when the source would have bound it. Scoping it
+to names that are actually read afterwards matters: the blanket version moved 479
+of the 5,000 outputs and broke two programs, this one moves 6 and breaks none.
+`evals/cc_for/cases/loop_result_returned_after_loop.py` covers it.
+
+### 12. A rebound namespace field was flattened at its reads
+
+`Measures(..., radial_offset=None)`, filled in once the other fields are known, is
+a real idiom:
+
+```python
+m.lid_fixer.radial_offset = outer_radius - 0.5 * m.rim_radial_thickness
+...polarArray(radius=m.lid_fixer.radial_offset, ...)
+```
+
+Flattening rewrote the read to `lid_fixer_radial_offset`, which still held the
+`None` placeholder — the write went to the object, the read did not, and
+`polarArray` got `None` for its radius. A field that appears as an
+attribute-store target anywhere in the module is no longer flattened at its
+reads; it is still exposed as a named parameter and still passed to the
+reconstruction, only the read stays on the object. 1 of the 5,000.
+`evals/cc_for/cases/namespace_field_filled_in_later.py` covers it.
+
 ### What the corpus-scale solid comparison says once it is finished
 
-Running it over all 5,000 programs, after the five fixes:
+Running it over all 5,000 programs on merged main, after all twelve fixes:
 
 | outcome                                                | programs |
 | ------------------------------------------------------ | -------- |
-| source and canonical build an identical solid           | 4,931    |
-| canonical program raises rather than building           | 15       |
-| source is not reproducible, so nothing can be compared  | 33       |
+| source and CC-step build an identical solid             | 4,950    |
+| CC-step program raises rather than building             | 0        |
+| source is not reproducible, so nothing can be compared  | 28       |
 | source does not build at all                            | 18       |
-| source crashes OpenCascade                              | 3        |
+| source crashes or hangs OpenCascade                     | 4        |
 
-Of the 4,946 whose source builds reproducibly, 4,931 convert to an identical
-solid and 15 raise. **None builds a different solid silently** — which is the
-claim that matters, because a silent difference is the only failure mode nothing
+**Every one of the 4,950 whose source builds reproducibly converts to a program
+that builds the identical solid** — none raises, and none differs. That is the
+claim worth making, because a silent difference is the only failure mode nothing
 else in the suite can see.
 
-Getting to that number needed care. A first pass reported 30 divergences and 33
-worker deaths; re-checking each one individually collapsed those to 5 candidates
-and 28 healthy programs, because one segfaulting program takes its whole batch's
-futures with it. Running the source of each remaining candidate in several fresh
-interpreters then showed all five to be unstable sources: `df224b5a` alternates
-between 72,419 mm³ / 173 faces and 74,112 mm³ / 156 faces from run to run,
+Getting to that number needed care. The raw sweep reported 26 divergences and 79
+worker deaths; re-checking each row on its own collapsed those to 3 candidates and
+76 healthy programs, because one segfaulting program takes its whole batch's
+futures down with it. Running each remaining candidate's source in several fresh
+interpreters then showed all three to be unstable sources: `df224b5a` alternates
+between 72,419 mm3 / 173 faces and 74,112 mm3 / 156 faces from run to run,
 canonical or not. A two-run determinism check is not enough to catch that; a
-five-run one across fresh processes is.
+four-run one across fresh processes is.
 
-The 15 that raise break down as six `self` attributes copy-propagated across an
-opaque builder call (defect 3), five names the SSA pass renamed on one definition
-but not another (defects 1 and 2), and four single instances — an
-`UnboundLocalError` on a generated `wpN`, a `TypeError` on `None`, a `ValueError`
-from an empty selector, and a `NameError` on a list built inside control flow —
-not yet traced to a family.
+Getting from 15 raising programs to none took the correctness fixes (defects 1-3)
+for eleven of them, defect 11 for the `UnboundLocalError` on a generated `wpN`,
+and defect 12 for the `TypeError` on `None`. The `ValueError` from an empty
+selector and the remaining single instances were unstable sources, not
+conversions: they raise from the source too, on a run where OpenCascade's
+selector finds nothing.
 
 ### Two limits left in place
 
@@ -491,7 +534,7 @@ canonicalization.
 4. A fluent chain in a `for` header, the one contract gap the converter still
    reports on itself.
 
-Defects 6-10 from the second pass are fixed; the two a structural scan can see
+Defects 6-12 from the second pass are fixed; the two a structural scan can see
 run corpus-wide as `loop_bindings_preserved` and `actions_reassemble`, and
 `--no-mesh-comparison` makes item 3 above practical -- it is how three of those
 five were found.
