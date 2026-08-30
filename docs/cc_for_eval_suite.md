@@ -392,36 +392,36 @@ reconstruction, only the read stays on the object. 1 of the 5,000.
 
 ### What the corpus-scale solid comparison says once it is finished
 
-Running it over all 5,000 programs, after the five fixes:
+Running it over all 5,000 programs on merged main, after all twelve fixes:
 
 | outcome                                                | programs |
 | ------------------------------------------------------ | -------- |
-| source and canonical build an identical solid           | 4,931    |
-| canonical program raises rather than building           | 15       |
-| source is not reproducible, so nothing can be compared  | 33       |
+| source and CC-step build an identical solid             | 4,950    |
+| CC-step program raises rather than building             | 0        |
+| source is not reproducible, so nothing can be compared  | 28       |
 | source does not build at all                            | 18       |
-| source crashes OpenCascade                              | 3        |
+| source crashes or hangs OpenCascade                     | 4        |
 
-Of the 4,946 whose source builds reproducibly, 4,931 convert to an identical
-solid and 15 raise. **None builds a different solid silently** — which is the
-claim that matters, because a silent difference is the only failure mode nothing
+**Every one of the 4,950 whose source builds reproducibly converts to a program
+that builds the identical solid** — none raises, and none differs. That is the
+claim worth making, because a silent difference is the only failure mode nothing
 else in the suite can see.
 
-Getting to that number needed care. A first pass reported 30 divergences and 33
-worker deaths; re-checking each one individually collapsed those to 5 candidates
-and 28 healthy programs, because one segfaulting program takes its whole batch's
-futures with it. Running the source of each remaining candidate in several fresh
-interpreters then showed all five to be unstable sources: `df224b5a` alternates
-between 72,419 mm³ / 173 faces and 74,112 mm³ / 156 faces from run to run,
+Getting to that number needed care. The raw sweep reported 26 divergences and 79
+worker deaths; re-checking each row on its own collapsed those to 3 candidates and
+76 healthy programs, because one segfaulting program takes its whole batch's
+futures down with it. Running each remaining candidate's source in several fresh
+interpreters then showed all three to be unstable sources: `df224b5a` alternates
+between 72,419 mm3 / 173 faces and 74,112 mm3 / 156 faces from run to run,
 canonical or not. A two-run determinism check is not enough to catch that; a
-five-run one across fresh processes is.
+four-run one across fresh processes is.
 
-The 15 that raise break down as six `self` attributes copy-propagated across an
-opaque builder call (defect 3), five names the SSA pass renamed on one definition
-but not another (defects 1 and 2), and four single instances — an
-`UnboundLocalError` on a generated `wpN`, a `TypeError` on `None`, a `ValueError`
-from an empty selector, and a `NameError` on a list built inside control flow —
-not yet traced to a family.
+Getting from 15 raising programs to none took the correctness fixes (defects 1-3)
+for eleven of them, defect 11 for the `UnboundLocalError` on a generated `wpN`,
+and defect 12 for the `TypeError` on `None`. The `ValueError` from an empty
+selector and the remaining single instances were unstable sources, not
+conversions: they raise from the source too, on a run where OpenCascade's
+selector finds nothing.
 
 ### Two limits left in place
 
