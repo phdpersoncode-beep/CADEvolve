@@ -369,6 +369,11 @@ def _is_geometry_statement(
             _WORKPLANE_NAME.match(target.id) or target.id == result_name
         ):
             return True
+        # ``sweep_path = wp3`` binds a Workplane step to the source's own name so
+        # a helper can still resolve it; the value is geometry however the target
+        # is spelled.
+        if isinstance(stmt.value, ast.Name) and _WORKPLANE_NAME.match(stmt.value.id):
+            return True
         return not _is_pure_data(stmt.value, containers)
     return True  # loops, defs, classes, expressions: modelling territory
 

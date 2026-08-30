@@ -528,6 +528,36 @@ result = Part().model
                 validation = validate_round_trip(source, converted.code)
                 self.assertTrue(validation.success, validation.to_dict())
 
+    def test_module_geometry_read_in_a_helper_keeps_its_binding(self) -> None:
+        """A ``def`` resolves a module-level name at call time, not at lowering.
+
+        Rewriting the module-level reads to the ``wpN`` is right; dropping the
+        assignment with them is not, because the helper's read has nothing left
+        to resolve against.
+        """
+
+        source = """
+import cadquery as cq
+radius = 60.0
+span = 70.0
+width = 14.0
+height = 18.0
+sweep_path = cq.Workplane('XY').radiusArc((span, 0.0), radius).wire()
+body = cq.Workplane('XY').transformed(rotate=(90, 0, 0)).rect(width, height).sweep(sweep_path, transition='round')
+
+def groove(offset):
+    return cq.Workplane('XY').transformed(rotate=(90, 0, 0)).rect(5.0, 6.0).translate((-offset, 0, 0)).sweep(sweep_path, transition='round')
+result = body.cut(groove(3.0))
+"""
+        for placement in ("preamble", "late"):
+            with self.subTest(placement=placement):
+                converted = canonicalize_code(
+                    source, CCForConfig(parameter_placement=placement)
+                )
+                self.assertRegex(converted.code, r"sweep_path = wp\d+")
+                validation = validate_round_trip(source, converted.code)
+                self.assertTrue(validation.success, validation.to_dict())
+
     def test_user_examples_survive_symbolic_numeric_binarization(self) -> None:
         for name in (
             "mounting_base_with_boss.py",

@@ -164,6 +164,15 @@ class _ScopedNameCollector(ast.NodeVisitor):
         elif isinstance(node.ctx, (ast.Store, ast.Del)):
             self.assigned.add(node.id)
 
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        # Python represents the target of ``x += y`` with ``Store`` context,
+        # even though the operation reads the old value before writing the new
+        # one.  Record both effects so loop-carried-state and reaching-
+        # definition analyses see the operation's actual semantics.
+        self.loaded.update(_target_names(node.target))
+        self.visit(node.target)
+        self.visit(node.value)
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self.assigned.add(node.name)
 
@@ -966,7 +975,14 @@ class _SSARenamer:
                 continue
 
             if isinstance(stmt, ast.AugAssign):
-                stmt.target = _rewrite_loads(stmt.target, env)
+                if isinstance(stmt.target, ast.Name):
+                    # AugAssign mutates its current reaching definition.  Keep
+                    # that version as the target instead of writing the
+                    # original, now-unbound source name.
+                    current = env.get(stmt.target.id, stmt.target.id)
+                    stmt.target = ast.copy_location(_store(current), stmt.target)
+                else:
+                    stmt.target = _rewrite_loads(stmt.target, env)
                 stmt.value = _rewrite_loads(stmt.value, env)
                 output.append(stmt)
                 continue
@@ -1752,6 +1768,32 @@ def _geometry_factory_names(tree: ast.AST) -> set[str]:
     return names
 
 
+def _nested_scope_reads(tree: ast.AST) -> set[str]:
+    """Names read inside a ``def``, ``class`` or ``lambda`` body.
+
+    Lowering rewrites a module-level geometry name to the ``wpN`` that carries
+    its value and drops the original assignment.  A nested scope resolves such a
+    name at call time, against the module globals, where the dropped assignment
+    was the only binding -- so the alias has to be materialized as well.
+    """
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bodies: list[ast.AST] = list(node.body)
+        elif isinstance(node, ast.Lambda):
+            bodies = [node.body]
+        else:
+            continue
+        for body in bodies:
+            names.update(
+                child.id
+                for child in ast.walk(body)
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+            )
+    return names
+
+
 class _WorkplaneLowerer:
     def __init__(self, tree: ast.Module, report: CCForReport, result_name: str) -> None:
         self.report = report
@@ -1761,6 +1803,7 @@ class _WorkplaneLowerer:
         self.helper_index = 0
         self.saw_result = False
         self.geometry_factories = _geometry_factory_names(tree)
+        self.nested_scope_reads = _nested_scope_reads(tree)
         self.global_result_state: str | None = None
         if any(
             isinstance(node, ast.Global) and result_name in node.names
@@ -2080,6 +2123,56 @@ class _WorkplaneLowerer:
             return None
         return _assign(stable_name, _load(current))
 
+    @staticmethod
+    def _load_mapping(
+        aliases: Mapping[str, str], dynamic: Mapping[str, str]
+    ) -> dict[str, str]:
+        """Return every currently valid replacement for a loaded name."""
+
+        return {**aliases, **dynamic}
+
+    def _opaque_attribute_roots(self, node: ast.AST) -> set[str]:
+        """Find receivers whose attributes an opaque method call may mutate.
+
+        Calls such as ``self.build()`` are mutation barriers: retaining
+        ``self.wp -> workplane`` across the call silently reads stale geometry.
+        Known CadQuery fluent/query methods are safe because their behavior is
+        already modeled by the expression lowerer.
+        """
+
+        roots: set[str] = set()
+        for call in ast.walk(node):
+            if not isinstance(call, ast.Call) or not isinstance(
+                call.func, ast.Attribute
+            ):
+                continue
+            if call.func.attr in (
+                _CADQUERY_GEOMETRY_METHODS
+                | _NON_GEOMETRY_METHODS
+                | self.geometry_factories
+            ):
+                continue
+            root = _state_key(call.func.value)
+            if root is not None:
+                roots.add(root)
+        return roots
+
+    @staticmethod
+    def _invalidate_attribute_aliases(
+        roots: Iterable[str],
+        aliases: MutableMapping[str, str],
+        dynamic: MutableMapping[str, str],
+    ) -> None:
+        for root in roots:
+            for mapping in (aliases, dynamic):
+                for key in list(mapping):
+                    # A method call may rebind attributes of its receiver, but
+                    # it cannot rebind the receiver expression itself.  Keeping
+                    # the exact root also preserves aliases through custom
+                    # Workplane extensions such as ``result.firstSolid()``.
+                    if key.startswith(f"{root}."):
+                        mapping.pop(key, None)
+
     def _spill_geometry(
         self, value: ast.AST, location: ast.AST, output: list[ast.stmt]
     ) -> ast.Name:
@@ -2106,8 +2199,24 @@ class _WorkplaneLowerer:
         aliases = dict(initial_aliases)
         dynamic = dict(initial_dynamic)
         output: list[ast.stmt] = []
+        pending_invalidations: set[str] = set()
 
         for stmt in statements:
+            # An opaque method call in the previous statement may have rebound
+            # receiver attributes.  Invalidate immediately before the next
+            # statement reads them, while still allowing the call itself to use
+            # the pre-call values in its arguments.
+            self._invalidate_attribute_aliases(
+                pending_invalidations, aliases, dynamic
+            )
+            pending_invalidations = (
+                set()
+                if isinstance(
+                    stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                )
+                else self._opaque_attribute_roots(stmt)
+            )
+
             if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
                 target = stmt.targets[0]
                 prefix, value, is_geometry = self._lower_expr(
@@ -2122,6 +2231,10 @@ class _WorkplaneLowerer:
                             output.append(_assign(dynamic[name], value, stmt))
                         else:
                             aliases[name] = value.id
+                            if name in self.nested_scope_reads:
+                                # A `def` reads this name at call time, against a
+                                # binding the alias would otherwise remove.
+                                output.append(_assign(name, value, stmt))
                         if tracks_result and name == self.result_name:
                             self.saw_result = True
                         continue
@@ -2149,7 +2262,10 @@ class _WorkplaneLowerer:
 
                 stmt.value = value
                 stmt.targets = [
-                    _rewrite_loads(target, aliases) for target in stmt.targets
+                    _rewrite_loads(
+                        target, self._load_mapping(aliases, dynamic)
+                    )
+                    for target in stmt.targets
                 ]
                 output.append(stmt)
                 key = _state_key(target)
@@ -2173,7 +2289,9 @@ class _WorkplaneLowerer:
                         aliases[stmt.target.id] = value.id
                         continue
                     stmt.value = value
-                output.append(_rewrite_loads(stmt, aliases))
+                output.append(
+                    _rewrite_loads(stmt, self._load_mapping(aliases, dynamic))
+                )
                 continue
 
             if isinstance(stmt, ast.For):
@@ -2201,7 +2319,9 @@ class _WorkplaneLowerer:
                 for key in _assigned_state_keys(stmt):
                     aliases.pop(key, None)
                     dynamic.pop(key, None)
-                stmt.iter = _rewrite_loads(stmt.iter, aliases)
+                stmt.iter = _rewrite_loads(
+                    stmt.iter, self._load_mapping(aliases, dynamic)
+                )
                 # The loop rebinds its target every iteration, so any alias
                 # recorded for that name earlier in the block is stale: rewriting
                 # a body read of it to the old ``wpN`` would union the same piece
@@ -2260,7 +2380,9 @@ class _WorkplaneLowerer:
                 for key in _assigned_state_keys(stmt):
                     aliases.pop(key, None)
                     dynamic.pop(key, None)
-                stmt.test = _rewrite_loads(stmt.test, aliases)
+                stmt.test = _rewrite_loads(
+                    stmt.test, self._load_mapping(aliases, dynamic)
+                )
                 stmt.body, _, _ = self._lower_block(
                     stmt.body,
                     aliases,
@@ -2292,7 +2414,9 @@ class _WorkplaneLowerer:
                 for key in _assigned_state_keys(stmt):
                     aliases.pop(key, None)
                     dynamic.pop(key, None)
-                stmt.test = _rewrite_loads(stmt.test, aliases)
+                stmt.test = _rewrite_loads(
+                    stmt.test, self._load_mapping(aliases, dynamic)
+                )
                 stmt.body, body_aliases, body_dynamic = self._lower_block(
                     stmt.body,
                     aliases,
@@ -2327,6 +2451,72 @@ class _WorkplaneLowerer:
                             stmt.orelse.append(
                                 _assign(stable_name, _load(else_name), stmt)
                             )
+                output.append(stmt)
+                continue
+
+            if isinstance(stmt, ast.Try):
+                assigned = _assigned_names(stmt)
+                branch_statements: list[ast.stmt] = [
+                    *stmt.body,
+                    *stmt.orelse,
+                    *stmt.finalbody,
+                ]
+                for handler in stmt.handlers:
+                    branch_statements.extend(handler.body)
+                geometry_assigned = assigned & self._geometry_assignment_candidates(
+                    branch_statements
+                )
+
+                # Pre-materialize every potentially path-dependent geometry
+                # name.  Branch assignments then write the stable runtime name
+                # at their original execution point, so exceptions preserve
+                # Python's control-flow semantics without alias joins.
+                for name in sorted(
+                    assigned & (set(aliases) | set(dynamic) | geometry_assigned)
+                ):
+                    if name in aliases:
+                        initializer = self._materialize_alias(
+                            name, aliases, dynamic
+                        )
+                        if initializer is not None:
+                            output.append(ast.copy_location(initializer, stmt))
+                    elif name not in dynamic:
+                        dynamic[name] = self._state_name(name)
+
+                stmt.body, body_aliases, body_dynamic = self._lower_block(
+                    stmt.body,
+                    aliases,
+                    dynamic,
+                    tracks_result=tracks_result,
+                )
+                stmt.orelse, _, _ = self._lower_block(
+                    stmt.orelse,
+                    body_aliases,
+                    body_dynamic,
+                    tracks_result=tracks_result,
+                )
+                for handler in stmt.handlers:
+                    if handler.type is not None:
+                        handler.type = _rewrite_loads(
+                            handler.type,
+                            self._load_mapping(aliases, dynamic),
+                        )
+                    handler.body, _, _ = self._lower_block(
+                        handler.body,
+                        aliases,
+                        dynamic,
+                        tracks_result=tracks_result,
+                    )
+                    if not handler.body:
+                        handler.body = [ast.copy_location(ast.Pass(), handler)]
+                stmt.finalbody, _, _ = self._lower_block(
+                    stmt.finalbody,
+                    aliases,
+                    dynamic,
+                    tracks_result=tracks_result,
+                )
+                if not stmt.body:
+                    stmt.body = [ast.copy_location(ast.Pass(), stmt)]
                 output.append(stmt)
                 continue
 
@@ -2394,7 +2584,13 @@ class _WorkplaneLowerer:
                     output.append(stmt)
                 continue
 
-            output.append(_rewrite_loads(stmt, aliases))
+            output.append(
+                _rewrite_loads(stmt, self._load_mapping(aliases, dynamic))
+            )
+
+        self._invalidate_attribute_aliases(
+            pending_invalidations, aliases, dynamic
+        )
 
         return output, aliases, dynamic
 
