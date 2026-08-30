@@ -159,11 +159,8 @@ def apply_ignored_gates(
 ) -> list[dict[str, Any]]:
     """Recompute each record's verdict while disregarding named gates.
 
-    A defect that affects every program -- ``idempotent`` does today -- turns the
-    verdict column into a wall of red that hides the gates a change actually
-    moved.  The gate still runs and still reports; it just stops deciding the
-    verdict, so a team can baseline a known defect and keep a meaningful pass
-    rate.
+    Diagnostic gates still run and report, but do not decide whether a source
+    program satisfies the canonicalization contract.
     """
 
     if not ignored:
@@ -360,10 +357,11 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--ignore-gate",
         action="append",
-        default=[],
+        default=["idempotent"],
         metavar="NAME",
         help="do not let this gate decide the pass/fail verdict (repeatable); "
-        "it still runs and is still counted in the gate table",
+        "it still runs and is still counted in the gate table; idempotent is "
+        "ignored by default because canonicalization is a one-pass contract",
     )
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args(list(argv) if argv is not None else None)

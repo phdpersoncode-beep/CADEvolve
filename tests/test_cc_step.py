@@ -29,15 +29,6 @@ CADEVOLVE_FIXTURES = Path(__file__).parent / "fixtures" / "cadevolve_p"
 CASES = Path(__file__).parents[1] / "evals" / "cc_for" / "cases"
 HAS_CADQUERY = importlib.util.find_spec("cadquery") is not None
 
-# Programs whose CC-for conversion is already known to be wrong; CC-step inherits
-# the defect because it shares every stage but parameter placement.  See
-# tests/test_cc_for_eval_suite.py for the analysis of each.
-KNOWN_BAD_CONVERSIONS = {
-    "augmented_assignment_offsets",
-    "result_read_before_alias",
-    "self_attribute_rebuild",
-}
-
 
 def convert(source: str, placement: str = "late"):
     return canonicalize_code(source, CCForConfig(parameter_placement=placement))
@@ -341,27 +332,10 @@ class LatePlacementGeometryTests(unittest.TestCase):
 
     def test_edge_cases_build_the_source_solid(self) -> None:
         for fixture in sorted(CASES.glob("*.py")):
-            if fixture.stem in KNOWN_BAD_CONVERSIONS:
-                continue
             source = fixture.read_text(encoding="utf-8")
             with self.subTest(fixture=fixture.name):
                 round_trip = validate_round_trip(source, convert(source).code)
                 self.assertTrue(round_trip.success, round_trip.to_dict())
-
-    def test_known_bad_conversions_are_no_worse_than_cc_for(self) -> None:
-        """A CC-for defect must not be reported as a CC-step regression."""
-
-        for name in sorted(KNOWN_BAD_CONVERSIONS):
-            source = (CASES / f"{name}.py").read_text(encoding="utf-8")
-            with self.subTest(fixture=name):
-                self.assertFalse(
-                    validate_round_trip(source, convert(source, "preamble").code).success,
-                    f"{name} now converts under CC-for; drop it from "
-                    "KNOWN_BAD_CONVERSIONS",
-                )
-                self.assertFalse(
-                    validate_round_trip(source, convert(source, "late").code).success
-                )
 
 
 @unittest.skipUnless(HAS_CADQUERY, "CadQuery is required for geometry comparison")
