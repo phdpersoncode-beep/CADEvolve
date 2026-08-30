@@ -558,6 +558,33 @@ result = body.cut(groove(3.0))
                 validation = validate_round_trip(source, converted.code)
                 self.assertTrue(validation.success, validation.to_dict())
 
+    def test_materializing_for_a_helper_never_duplicates_result(self) -> None:
+        """The result name is the one binding materialization must not restore.
+
+        A method that reads ``result`` would otherwise get its own top-level
+        ``result = wpN`` alongside the terminal one, and the contract allows
+        exactly one.
+        """
+
+        source = """
+import cadquery as cq
+width = 40.0
+thickness = 6.0
+
+class Part:
+    def __init__(self):
+        self.model = result
+part_holder = None
+result = cq.Workplane('XY').box(width, width, thickness)
+result = result.edges('|Z').fillet(1.0)
+"""
+        for placement in ("preamble", "late"):
+            with self.subTest(placement=placement):
+                converted = canonicalize_code(
+                    source, CCForConfig(parameter_placement=placement)
+                )
+                self.assertEqual(validate_structure(converted.code), [])
+
     def test_user_examples_survive_symbolic_numeric_binarization(self) -> None:
         for name in (
             "mounting_base_with_boss.py",

@@ -2231,9 +2231,16 @@ class _WorkplaneLowerer:
                             output.append(_assign(dynamic[name], value, stmt))
                         else:
                             aliases[name] = value.id
-                            if name in self.nested_scope_reads:
+                            if (
+                                name in self.nested_scope_reads
+                                and name != self.result_name
+                            ):
                                 # A `def` reads this name at call time, against a
-                                # binding the alias would otherwise remove.
+                                # binding the alias would otherwise remove.  The
+                                # result name is excluded: only its terminal
+                                # assignment may appear, and the loop-carried
+                                # state name already carries it into a nested
+                                # scope.
                                 output.append(_assign(name, value, stmt))
                         if tracks_result and name == self.result_name:
                             self.saw_result = True
