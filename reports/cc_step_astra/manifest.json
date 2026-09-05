@@ -1,0 +1,80 @@
+{
+  "base_commit": "1ee0d0d01cb02454e3cca0849f83cfe6b5b1d843",
+  "implementation_commit": "fb9d0f7ad205dbbfa1de6f2168180ca37e2c14be",
+  "archive_sha256": "319c840e39a6c756afef578efad22683df98b0e82f258bd9164f563ab54fa048",
+  "python": "3.11.15",
+  "cadquery": "2.5.2",
+  "cadquery_ocp": "7.7.2",
+  "full_suite": {
+    "passed": 213,
+    "subtests_passed": 322,
+    "seconds": 650.61,
+    "log": "pytest-release.log"
+  },
+  "focused_regressions": {
+    "passed": 31,
+    "log": "focused-final.log"
+  },
+  "corpus": {
+    "counts": {
+      "signature_match": 4935,
+      "source_unstable": 36,
+      "source_error": 17,
+      "worker_failure": 9,
+      "source_invalid": 3
+    },
+    "total": 5000,
+    "signature_and_coverage_candidates": 4921
+  },
+  "sample": {
+    "counts": {
+      "match": 125,
+      "comparison_error": 2,
+      "worker_failure": 1
+    },
+    "tracer_counts": {
+      "match": 114,
+      "error": 11
+    },
+    "seconds": 382.78810393799995,
+    "options": {
+      "corpus": "demo",
+      "limit": 128,
+      "seed": 42,
+      "workers": 2,
+      "timeout": 180.0,
+      "boolean": true,
+      "trace": true,
+      "repeats": 1,
+      "report": "../tmp/audit-tracer-release.jsonl"
+    }
+  },
+  "fixtures": {
+    "counts": {
+      "match": 11,
+      "comparison_error": 1
+    },
+    "tracer_counts": {
+      "match": 11
+    },
+    "seconds": 34.99041387299985,
+    "options": {
+      "corpus": "fixtures",
+      "limit": null,
+      "seed": 0,
+      "workers": 2,
+      "timeout": 120.0,
+      "boolean": true,
+      "trace": true,
+      "repeats": 1,
+      "report": "../tmp/audit-fixtures-confirmed.jsonl"
+    }
+  },
+  "source_stability_policy": "Conservative union of observed source variation/errors; worker failures retained despite successful retries.",
+  "hash_policy": "All 5,000 final canonical hashes recomputed; eight changed first-pass outputs re-executed; three initial namespace failures rechecked.",
+  "limits": [
+    "5,000-program screen uses signatures, not Boolean checks.",
+    "128-program sample uses Boolean checks; indeterminate results are not passes.",
+    "Legacy comparison is unscaled standardization, not the full normalization/quantization pipeline."
+  ]
+}

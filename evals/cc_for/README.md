@@ -1,5 +1,10 @@
 # CC-for evaluation suite
 
+The [astra-and-beyond audit](../../docs/cc_step_astra_audit.md) adds
+`audit_corpus.py` for disposable-process execution, per-input deadlines, streaming
+JSONL evidence, and optional same-frame CAD Boolean comparison. Use it for large
+geometry runs where native crashes must not invalidate neighboring inputs.
+
 An independent check on the canonicalizer
 (`dataset_utils/utils/canonicalization/cc_for.py`): does the canonical program
 mean the same thing as the source, and does it still *say* it symbolically?

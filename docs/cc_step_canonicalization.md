@@ -1,5 +1,11 @@
 # CC-step canonicalization
 
+For the current geometry audit, corrected validation contract, and known limits,
+see [the astra-and-beyond audit](cc_step_astra_audit.md). The measured-results
+section below records the earlier PR #8 baseline; it does not include the new
+same-frame solid-difference check. The proposed MCTS action-format changes are
+in [IMPROVEMENT_PLAN.md](../IMPROVEMENT_PLAN.md).
+
 CC-step is the CC-for representation with the parameter block broken up: instead
 of one preamble after the imports, each parameter group sits directly above the
 modelling step that consumes it. Everything else — loop preservation, named
@@ -114,6 +120,12 @@ that quietly means something else. It does not occur in the demo corpus;
 
 ## Actions
 
+These are currently lowered-statement actions, not recovered CAD features.
+Parameter placement happens before lowering, whereas decomposition happens
+afterward: a group can therefore be attached to `Workplane()` with its consuming
+`box()` in the following action. Source-block metadata is a proposed improvement,
+not part of the current format.
+
 Step-ToCAD action decomposition follows the placement. Under CC-step the
 docstring and imports are the only standalone header; every other action is one
 parameter group plus the modelling statement it was placed for, with the
@@ -191,6 +203,11 @@ PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_eval \
 
 ## Representation agreement
 
+Despite its historical name, `build_cadevolve_c` builds the unscaled legacy
+standardization stage. It does not run centering, extent scaling, or integer
+quantization. Comparisons now also require same-frame occupied-volume agreement;
+independently normalized mesh scores cannot establish transform correctness.
+
 `evals/cc_for/representations.py` builds a program four ways — source,
 CADEvolve-C, CC-for, CC-step — executes each and compares the solids pairwise.
 The two symbolic representations are held to exact equality, since they copy
@@ -209,7 +226,7 @@ PYTHONPATH=.:dataset_utils python -m evals.cc_for.run_representations \
   --corpus fixtures --report logs/representations.json
 ```
 
-## Measured results
+## Earlier measured results (PR #8)
 
 Zero-to-CAD and CADEvolve-P fixtures (12 programs), full geometry gates
 including quantization and parameter perturbation:

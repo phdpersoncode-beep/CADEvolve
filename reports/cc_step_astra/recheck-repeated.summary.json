@@ -1,0 +1,22 @@
+{
+  "counts": {
+    "source_error": 8,
+    "source_unstable": 49,
+    "match": 33,
+    "signature_mismatch": 12,
+    "canonical_error": 2
+  },
+  "tracer_counts": {},
+  "seconds": 183.47307412700002,
+  "options": {
+    "corpus": "../tmp/recheck_repeated",
+    "limit": null,
+    "seed": 0,
+    "workers": 3,
+    "timeout": 120.0,
+    "boolean": false,
+    "trace": false,
+    "repeats": 4,
+    "report": "../tmp/recheck-repeated.jsonl"
+  }
+}

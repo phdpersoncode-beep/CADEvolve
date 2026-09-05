@@ -1,5 +1,10 @@
 # CC-for validation on Zero-to-CAD
 
+This is a historical validation record. See the
+[astra-and-beyond CC-step audit](cc_step_astra_audit.md) for later fixes and
+stronger geometry checks. A scalar/topology signature or normalized surface
+score alone is not a solid-equivalence test.
+
 Validated on 2026-08-20 against
 [`ADSKAILab/Zero-To-CAD-100k`](https://huggingface.co/datasets/ADSKAILab/Zero-To-CAD-100k)
 revision `48bcf0a8c6fbfb47a27f5662007c24dff8d754ae`. The runner projects only

@@ -1,0 +1,26 @@
+[
+  {
+    "name": "loop_over_geometry_iterable.py",
+    "failed_gates": [
+      "structure"
+    ],
+    "gates": [
+      {
+        "name": "structure",
+        "passed": false,
+        "skipped": false,
+        "detail": {
+          "structural_errors": [
+            "found 1 unlowered fluent CadQuery call(s)"
+          ],
+          "contract_errors": [
+            "found 1 unlowered fluent CadQuery call(s)"
+          ],
+          "workplane_steps": 8
+        },
+        "error": null,
+        "seconds": 0.00042233599970131763
+      }
+    ]
+  }
+]

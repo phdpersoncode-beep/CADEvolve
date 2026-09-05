@@ -1,0 +1,22 @@
+{
+  "counts": {
+    "match": 11,
+    "source_error": 2,
+    "source_unstable": 2,
+    "worker_failure": 2,
+    "signature_mismatch": 1
+  },
+  "tracer_counts": {},
+  "seconds": 126.42665648799994,
+  "options": {
+    "corpus": "../tmp/recheck_tail",
+    "limit": null,
+    "seed": 0,
+    "workers": 3,
+    "timeout": 120.0,
+    "boolean": false,
+    "trace": false,
+    "repeats": 1,
+    "report": "../tmp/recheck-tail.jsonl"
+  }
+}

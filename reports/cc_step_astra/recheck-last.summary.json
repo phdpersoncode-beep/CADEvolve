@@ -1,0 +1,19 @@
+{
+  "counts": {
+    "match": 6,
+    "source_unstable": 2
+  },
+  "tracer_counts": {},
+  "seconds": 23.345639491999464,
+  "options": {
+    "corpus": "../tmp/recheck_last",
+    "limit": null,
+    "seed": 0,
+    "workers": 2,
+    "timeout": 120.0,
+    "boolean": false,
+    "trace": false,
+    "repeats": 8,
+    "report": "../tmp/recheck-last.jsonl"
+  }
+}

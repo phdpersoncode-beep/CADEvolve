@@ -1,5 +1,8 @@
 # CC-for evaluation results
 
+For the later CC-step audit, including additional regressions and same-frame
+occupied-volume checks, see [cc_step_astra_audit.md](cc_step_astra_audit.md).
+
 Independent evaluation of the CC-for canonicalization pipeline
 (PR [#1](https://github.com/phdpersoncode-beep/CADEvolve/pull/1),
 branch `agent/cc-for-canonicalization`) using the suite in

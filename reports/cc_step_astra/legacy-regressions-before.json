@@ -1,0 +1,48 @@
+[
+  {
+    "name": "keyword_origin",
+    "source": "import cadquery as cq\nresult = cq.Workplane('XY', origin=(10, 0, 0)).box(2, 3, 4)\n",
+    "traced": "import cadquery as cq\nwp1 = cq.Workplane('XY')\nwp2 = wp1.box(2, 3, 4)\nresult = wp2",
+    "mismatches": [
+      "bounds[0]: 9.0 != -1.0",
+      "bounds[3]: 11.0 != 1.0",
+      "center_of_mass[0]: 10.0 != 8.384496800554569e-18"
+    ]
+  },
+  {
+    "name": "positional_origin",
+    "source": "import cadquery as cq\nresult = cq.Workplane('XY', (10, 0, 0)).box(2, 3, 4)\n",
+    "traced": "import cadquery as cq\nwp1 = wp2.box(2, 3, 4)\nresult = wp1",
+    "error": "NameError: name 'wp2' is not defined"
+  },
+  {
+    "name": "actual_result",
+    "source": "import cadquery as cq\nresult = cq.Workplane('XY').box(2, 3, 4)\nunused = cq.Workplane('XY').box(8, 9, 10)\n",
+    "traced": "import cadquery as cq\nwp1 = cq.Workplane('XY')\nwp2 = wp1.box(2, 3, 4)\nwp3 = cq.Workplane('XY')\nwp4 = wp3.box(8, 9, 10)\nresult = wp4",
+    "mismatches": [
+      "volume: 23.999999999999996 != 720.0",
+      "area: 52.0 != 483.99999999999994",
+      "bounds[0]: -1.0 != -4.0",
+      "bounds[1]: -1.5 != -4.5",
+      "bounds[2]: -2.0 != -5.0",
+      "bounds[3]: 1.0 != 4.0",
+      "bounds[4]: 1.5 != 4.5",
+      "bounds[5]: 2.0 != 5.0"
+    ]
+  },
+  {
+    "name": "shape_result",
+    "source": "import cadquery as cq\nresult = cq.Workplane('XY').box(2, 3, 4).val().translate((10, 0, 0))\n",
+    "traced": "import cadquery as cq\nwp1 = cq.Workplane('XY')\nwp2 = wp1.box(2, 3, 4)\nwp3 = wp2.val()\nwp4 = cq.Solid.translate(wp3, [10, 0, 0])\nresult = wp2",
+    "mismatches": [
+      "bounds[0]: 9.0 != -1.0",
+      "bounds[3]: 11.0 != 1.0",
+      "center_of_mass[0]: 10.000000000000002 != 8.384496800554569e-18"
+    ]
+  },
+  {
+    "name": "stdout",
+    "source": "import cadquery as cq\nresult = cq.Workplane('XY').box(2, 3, 4)\nprint('built')\n",
+    "error": "RuntimeError: tracer produced no standardized program"
+  }
+]
