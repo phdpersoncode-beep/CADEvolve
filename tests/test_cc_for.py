@@ -638,7 +638,6 @@ result = cq.Workplane('XY').circle(m.radius).extrude(m.thickness)
         for name in (
             "mounting_base_with_boss.py",
             "sinusoidal_channel_housing.py",
-            "vented_cap.py",
         ):
             source = (FIXTURES / name).read_text(encoding="utf-8")
             converted = canonicalize_code(source)
@@ -654,6 +653,13 @@ result = cq.Workplane('XY').circle(m.radius).extrude(m.thickness)
         vented = canonicalize_code(
             (FIXTURES / "vented_cap.py").read_text(encoding="utf-8")
         )
+        # The old Chamfer-only gate accepted this invalid rounded solid.
+        # Source/canonical agreement does not make lossy binarization safe.
+        rejected = validate_quantized_geometry(
+            (FIXTURES / "vented_cap.py").read_text(encoding="utf-8"), vented.code
+        )
+        self.assertFalse(rejected.success)
+        self.assertIn("not a valid positive-volume solid", rejected.error)
         quantized = binarize_numeric_literals(vented.code)
         self.assertIn("chamfer_distance = 1", quantized)
 

@@ -16,6 +16,7 @@ class Binarize(ast.NodeTransformer):
     def __init__(self, zero_tol: float = 1e-7, min_positive: int = 1):
         self.zero_tol = zero_tol
         self.min_positive = int(min_positive)
+        self._literal_values = {}
 
         self.nonzero_methods = {
             "fillet":  {"pos": [0], "mode": "gt0"},
@@ -26,8 +27,8 @@ class Binarize(ast.NodeTransformer):
             "hole": {"pos": [0], "mode": "gt0"},
             "cborehole": {"pos": [0, 1, 2], "mode": "gt0"},
             "cskhole": {"pos": [0, 1, 2], "mode": "gt0"},
-            "extrude": {"pos": [0], "mode": "ne0"},
-            "shell": {"pos": [0], "mode": "gt0"},
+            "extrude": {"pos": [0], "kw": ["distance"], "mode": "ne0"},
+            "shell": {"pos": [0], "kw": ["thickness"], "mode": "ne0"},
             "rect": {"pos": [0, 1], "mode": "gt0"},
             "splineapprox": {"pos": [1, 2, 3], "kw": ["tol", "minDeg", "maxDeg", "mindeg", "maxdeg"], "mode": "gt0"},
         }
@@ -48,11 +49,20 @@ class Binarize(ast.NodeTransformer):
             return node
 
         if isinstance(v, (int, float)):
+            self._literal_values[(getattr(node, "lineno", None), getattr(node, "col_offset", None))] = v
             new_v = self.clean(v)
             return ast.copy_location(ast.Constant(value=new_v), node)
         return node
 
     def visit_UnaryOp(self, node: ast.UnaryOp):
+        # Record the signed literal before visiting/rounding its operand. Once
+        # -0.4 becomes 0, a nonzero clamp otherwise extrudes in the wrong direction.
+        try:
+            original = ast.literal_eval(node)
+        except (ValueError, TypeError):
+            original = None
+        if isinstance(original, (int, float)) and not isinstance(original, bool):
+            self._literal_values[(getattr(node, "lineno", None), getattr(node, "col_offset", None))] = original
         node = self.generic_visit(node)
         if isinstance(node.op, (ast.UAdd, ast.USub)) and isinstance(node.operand, ast.Constant):
             v = node.operand.value
@@ -80,7 +90,11 @@ class Binarize(ast.NodeTransformer):
         if isinstance(v, (int, float)):
             iv = int(v)
             if self._needs_clamp(iv, mode):
-                return ast.copy_location(ast.Constant(value=self.min_positive), const_node)
+                original = self._literal_values.get(
+                    (getattr(const_node, "lineno", None), getattr(const_node, "col_offset", None)), v
+                )
+                sign = -1 if mode == "ne0" and original < 0 else 1
+                return ast.copy_location(ast.Constant(value=sign * self.min_positive), const_node)
         return const_node
 
     def _point_key(self, node: ast.AST):

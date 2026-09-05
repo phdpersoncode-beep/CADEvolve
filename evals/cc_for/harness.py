@@ -35,6 +35,7 @@ from utils.canonicalization.cc_for import (
     join_actions,
     validate_structure,
 )
+from utils.canonicalization.execution import execute_program
 
 from . import code_metrics
 from .geometry import DEFAULT_SURFACE_POINTS, compare_metrics, shape_metrics
@@ -160,10 +161,8 @@ def execute(
     filename: str = "<program>",
     timeout: float = DEFAULT_EXECUTION_TIMEOUT,
 ) -> dict[str, Any]:
-    namespace: dict[str, Any] = {"__name__": "__cad_program__"}
     with time_limit(timeout):
-        exec(compile(code, filename, "exec"), namespace, namespace)
-    return namespace
+        return execute_program(code, filename)
 
 
 def _result_of(namespace: dict[str, Any], result_name: str) -> Any:

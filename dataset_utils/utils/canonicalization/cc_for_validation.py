@@ -21,6 +21,7 @@ from .cc_for import (
     decompose_actions,
     join_actions,
 )
+from .execution import execute_program
 
 
 @dataclass(frozen=True)
@@ -53,6 +54,7 @@ class RoundTripValidation:
     canonical: ShapeSignature | None = None
     comparison: SignatureComparison | None = None
     error: str | None = None
+    solid_comparison: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -68,6 +70,8 @@ class QuantizedGeometryValidation:
     chamfer_threshold: float = 0.15
     sample_points: int = 0
     error: str | None = None
+    normalized_volume_iou: float | None = None
+    min_volume_iou: float = 0.8
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -109,17 +113,18 @@ class PerturbationValidation:
 def _as_shape(result: Any) -> Any:
     if result is None:
         raise ValueError("program did not define a non-None result")
+    if hasattr(result, "vals") and callable(result.vals):
+        import cadquery as cq
+
+        objects = result.vals()
+        if not objects or not all(isinstance(obj, cq.Shape) for obj in objects):
+            raise ValueError("result stack must contain geometry only")
+        return objects[0] if len(objects) == 1 else cq.Compound.makeCompound(objects)
     if hasattr(result, "val") and callable(result.val):
         result = result.val()
     if result is None:
         raise ValueError("result.val() returned None")
     return result
-
-
-def execute_program(code: str) -> dict[str, Any]:
-    namespace: dict[str, Any] = {}
-    exec(compile(code, "<cad-program>", "exec"), namespace, namespace)
-    return namespace
 
 
 def _count(shape: Any, method: str) -> int:
@@ -187,6 +192,45 @@ def compare_signatures(
     return SignatureComparison(equivalent=not mismatches, mismatches=tuple(mismatches))
 
 
+def compare_solid_geometry(
+    left: Any,
+    right: Any,
+    *,
+    relative_tolerance: float = 1e-7,
+    absolute_tolerance: float = 1e-7,
+) -> dict[str, Any]:
+    """Compare occupied volume in the SAME coordinate frame using two CAD cuts.
+
+    Matching volume/bounds/topology counts does not prove geometric equality.
+    Sum absolute residual solid volumes so orientation errors cannot cancel out.
+    This is a tolerance-based solid check, not proof of identical B-Rep topology.
+    Run inside a disposable worker: OpenCascade boolean operations can hang.
+    """
+    shapes = [_as_shape(left), _as_shape(right)]
+    volumes = []
+    for shape in shapes:
+        solids = shape.Solids()
+        if not solids or not shape.isValid():
+            raise ValueError("comparison requires valid, nonempty solids")
+        values = [float(solid.Volume()) for solid in solids]
+        if any(not math.isfinite(value) or value <= 0 for value in values):
+            raise ValueError("comparison requires finite, positive solid volumes")
+        volumes.append(sum(values))
+    residuals = []
+    for a, b in (shapes, shapes[::-1]):
+        difference = a.cut(b)
+        if not difference.isValid():
+            raise ValueError("boolean difference produced invalid geometry")
+        residual = sum(abs(float(solid.Volume())) for solid in difference.Solids())
+        if not math.isfinite(residual):
+            raise ValueError("boolean difference has nonfinite volume")
+        residuals.append(residual)
+    threshold = max(absolute_tolerance, relative_tolerance * max(volumes))
+    return {"equivalent": sum(residuals) <= threshold,
+            "left_only_volume": residuals[0], "right_only_volume": residuals[1],
+            "relative_difference": sum(residuals) / max(volumes), "threshold": threshold}
+
+
 def validate_round_trip(
     original_code: str,
     canonical_code: str,
@@ -194,6 +238,7 @@ def validate_round_trip(
     result_name: str = "result",
     relative_tolerance: float = 1e-7,
     absolute_tolerance: float = 1e-7,
+    check_boolean: bool = False,
 ) -> RoundTripValidation:
     try:
         original_ns = execute_program(original_code)
@@ -206,11 +251,21 @@ def validate_round_trip(
             relative_tolerance=relative_tolerance,
             absolute_tolerance=absolute_tolerance,
         )
+        solid_comparison = None
+        if comparison.equivalent and check_boolean:
+            solid_comparison = compare_solid_geometry(
+                original_ns.get(result_name), canonical_ns.get(result_name),
+                relative_tolerance=relative_tolerance,
+                absolute_tolerance=absolute_tolerance,
+            )
         return RoundTripValidation(
-            success=comparison.equivalent,
+            success=comparison.equivalent and (
+                solid_comparison is None or solid_comparison["equivalent"]
+            ),
             original=original,
             canonical=canonical,
             comparison=comparison,
+            solid_comparison=solid_comparison,
         )
     except Exception as error:  # Validation must report per-file failures.
         return RoundTripValidation(success=False, error=f"{type(error).__name__}: {error}")
@@ -418,6 +473,7 @@ def validate_quantized_geometry(
     random_seed: int = 0,
     chamfer_threshold: float = 0.15,
     tessellation_tolerance: float = 0.1,
+    min_volume_iou: float = 0.8,
 ) -> QuantizedGeometryValidation:
     """Validate CC-for before and after CADEvolve-style binarization.
 
@@ -429,9 +485,19 @@ def validate_quantized_geometry(
 
     if sample_points < 1:
         raise ValueError("sample_points must be positive")
+    if not 0 <= min_volume_iou <= 1:
+        raise ValueError("min_volume_iou must be between zero and one")
     try:
         quantized_original = binarize_numeric_literals(original_code)
         quantized_canonical = binarize_numeric_literals(canonical_code)
+        try:
+            execute_program(quantized_original)
+        except Exception as error:
+            return QuantizedGeometryValidation(
+                success=False, error=f"binarized source failed to execute: {type(error).__name__}: {error}",
+                chamfer_threshold=chamfer_threshold, sample_points=sample_points,
+                min_volume_iou=min_volume_iou,
+            )
         quantized_pair = validate_round_trip(
             quantized_original,
             quantized_canonical,
@@ -450,6 +516,31 @@ def validate_quantized_geometry(
 
         original_ns = execute_program(original_code)
         quantized_ns = execute_program(quantized_canonical)
+        normalized = []
+        for value in (original_ns.get(result_name), quantized_ns.get(result_name)):
+            shape = _as_shape(value)
+            solids = shape.Solids()
+            if not shape.isValid() or not solids or any(
+                not math.isfinite(solid.Volume()) or solid.Volume() <= 0 for solid in solids
+            ):
+                raise ValueError("raw or binarized geometry is not a valid positive-volume solid")
+            box = shape.BoundingBox()
+            extent = max(box.xlen, box.ylen, box.zlen)
+            if not math.isfinite(extent) or extent <= 0:
+                raise ValueError("raw or binarized geometry has invalid extent")
+            center = ((box.xmin + box.xmax) / 2, (box.ymin + box.ymax) / 2,
+                      (box.zmin + box.zmax) / 2)
+            normalized.append(shape.translate(tuple(-x for x in center)).scale(1 / extent))
+        a, b = normalized
+        intersection = a.intersect(b)
+        if not intersection.isValid():
+            raise ValueError("normalized intersection is invalid")
+        shared = intersection.Volume()
+        union = a.Volume() + b.Volume() - shared
+        iou = shared / union if union > 0 else 0.0
+        if not math.isfinite(iou) or iou < -1e-7 or iou > 1 + 1e-7:
+            raise ValueError("normalized volume IoU is invalid")
+        iou = max(0.0, min(1.0, iou))
         original_points = _sample_normalized_surface(
             original_ns.get(result_name),
             sample_points=sample_points,
@@ -466,15 +557,17 @@ def validate_quantized_geometry(
             original_points, quantized_points
         )
         return QuantizedGeometryValidation(
-            success=chamfer <= chamfer_threshold,
+            success=chamfer <= chamfer_threshold and iou >= min_volume_iou,
             quantized_pair=quantized_pair,
             raw_to_quantized_chamfer=chamfer,
             chamfer_threshold=chamfer_threshold,
             sample_points=sample_points,
+            normalized_volume_iou=iou,
+            min_volume_iou=min_volume_iou,
             error=(
                 None
-                if chamfer <= chamfer_threshold
-                else f"normalized Chamfer {chamfer} exceeds {chamfer_threshold}"
+                if chamfer <= chamfer_threshold and iou >= min_volume_iou
+                else f"quantized geometry failed: Chamfer={chamfer:g}, volume IoU={iou:g}"
             ),
         )
     except Exception as error:
@@ -483,6 +576,7 @@ def validate_quantized_geometry(
             chamfer_threshold=chamfer_threshold,
             sample_points=sample_points,
             error=f"{type(error).__name__}: {error}",
+            min_volume_iou=min_volume_iou,
         )
 
 

@@ -21,6 +21,7 @@ from typing import Any
 import yaml
 
 from utils.canonicalization.cc_for import CCForConfig, canonicalize_code
+from utils.isolated import iter_isolated
 from utils.canonicalization.cc_for_validation import (
     validate_parameter_perturbations,
     validate_prefixes,
@@ -43,6 +44,8 @@ class PipelineConfig:
     validate_perturbations: bool = False
     max_perturbed_parameters: int = 16
     keep_failed: bool = False
+    job_timeout: float = 120.0
+    validate_boolean_geometry: bool = True
 
 
 def load_config(path: Path) -> PipelineConfig:
@@ -63,6 +66,8 @@ def load_config(path: Path) -> PipelineConfig:
         validate_perturbations=bool(raw.get("validate_perturbations", False)),
         max_perturbed_parameters=int(raw.get("max_perturbed_parameters", 16)),
         keep_failed=bool(raw.get("keep_failed", False)),
+        job_timeout=float(raw.get("job_timeout", 120.0)),
+        validate_boolean_geometry=bool(raw.get("validate_boolean_geometry", True)),
     )
 
 
@@ -117,7 +122,9 @@ def _process_one(source_string: str, config_data: dict[str, Any]) -> dict[str, A
         success = not conversion.report.structural_errors
 
         if config.validate_execution:
-            round_trip = validate_round_trip(original, conversion.code)
+            round_trip = validate_round_trip(
+                original, conversion.code, check_boolean=config.validate_boolean_geometry
+            )
             record["round_trip"] = round_trip.to_dict()
             success = success and round_trip.success
 
@@ -169,7 +176,25 @@ def run_pipeline(config: PipelineConfig) -> dict[str, Any]:
     config_data = asdict(config)
 
     records: dict[str, dict[str, Any]] = {}
-    if config.n_workers == 1:
+    executes_code = (config.validate_execution or config.validate_prefix_execution
+                     or config.validate_perturbations)
+    if executes_code:
+        # Each CAD job gets its own process. A native crash or a non-returning
+        # kernel operation cannot poison other inputs or stall the whole batch.
+        jobs = [(str(source), config_data) for source in sources]
+        with config.report_path.open("w", encoding="utf-8") as checkpoint:
+            for finished in iter_isolated(
+                _process_one, jobs, workers=config.n_workers, timeout=config.job_timeout
+            ):
+                source = sources[finished.index]
+                record = finished.value if finished.error is None else {
+                    "source": str(source), "success": False, "written": False,
+                    "error": finished.error,
+                }
+                records[str(source)] = record
+                checkpoint.write(json.dumps(record, sort_keys=True) + "\n")
+                checkpoint.flush()
+    elif config.n_workers == 1:
         for source in sources:
             records[str(source)] = _process_one(str(source), config_data)
     else:
@@ -230,4 +255,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
