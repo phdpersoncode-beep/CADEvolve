@@ -15,3 +15,9 @@ validate_prefix_execution: true
 validate_perturbations: false
 max_perturbed_parameters: 16
 keep_failed: false
+
+# Enforced by the parent process, including native OpenCascade hangs.
+job_timeout: 120
+# Compare occupied volume in the original coordinate frame, in addition to
+# topology/mass signatures. No independent centering/scaling during this check.
+validate_boolean_geometry: true

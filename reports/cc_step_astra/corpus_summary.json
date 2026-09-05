@@ -1,0 +1,11 @@
+{
+  "counts": {
+    "signature_match": 4935,
+    "source_unstable": 36,
+    "source_error": 17,
+    "worker_failure": 9,
+    "source_invalid": 3
+  },
+  "total": 5000,
+  "signature_and_coverage_candidates": 4921
+}

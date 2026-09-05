@@ -43,6 +43,7 @@ from evals.cc_for.harness import (  # noqa: E402
     execute,
 )
 from utils.canonicalization.cc_for import CCForConfig, canonicalize_code  # noqa: E402
+from utils.canonicalization.cc_for_validation import compare_solid_geometry  # noqa: E402
 
 SOURCE = "source"
 CADEVOLVE_C = "cadevolve_c"
@@ -74,9 +75,10 @@ DEFAULT_TRACER_TIMEOUT = 180.0
 
 # Driving the legacy tracer: record the program, then emit the standardized form.
 _TRACER_DRIVER = """
-import json, sys
+import contextlib, json, sys
 sys.path[:0] = [%(root)r, %(dataset_utils)r]
 from utils.canonicalization import standardizing
+from utils.canonicalization.execution import execute_program
 
 source = open(%(source_path)r, encoding="utf-8").read()
 if "parametricCurve" in source:
@@ -89,12 +91,15 @@ elif "lambda" in source:
 standardizing.LOG.clear()
 standardizing.patch()
 try:
-    namespace = {}
-    exec(compile(source, "<source>", "exec"), namespace, namespace)
+    with contextlib.redirect_stdout(sys.stderr):
+        namespace = execute_program(source, "<source>")
 finally:
     standardizing.unpatch()
 
-code = standardizing.standardize_code(standardizing.LOG, final_var=%(result_name)r)
+code = standardizing.standardize_code(
+    standardizing.LOG, final_var=%(result_name)r,
+    final_ref=standardizing._ser(namespace[%(result_name)r]),
+)
 json.dump({"code": code, "calls": len(standardizing.LOG)}, sys.stdout)
 """
 
@@ -175,7 +180,10 @@ def build_cadevolve_c(
     timeout: float = DEFAULT_TRACER_TIMEOUT,
     workdir: Path | None = None,
 ) -> str:
-    """Return the legacy CADEvolve-C form of ``source``.
+    """Return the legacy unscaled standardized trace of ``source``.
+
+    The historical helper name does not imply that centering, extent scaling,
+    or integer quantization is applied here. Those are separate lossy stages.
 
     Raises ``RuntimeError`` when the tracer cannot record the program; that is a
     property of the legacy stage, not of the representation being tested, so
@@ -405,6 +413,12 @@ def compare_representations(
             scores = similarity.compare_shapes(
                 _solid(left), _solid(right), **similarity_kwargs
             ).to_dict()
+            # Independent mesh normalization hides translations and uniform scale
+            # errors. Verify occupied volume in the original frame as well.
+            solid_comparison = compare_solid_geometry(
+                _solid(left), _solid(right),
+                relative_tolerance=(EXACT_RELATIVE_TOLERANCE if exact else TRACED_RELATIVE_TOLERANCE),
+            )
         except Exception as error:
             comparisons.append(
                 RepresentationComparison(
@@ -426,7 +440,7 @@ def compare_representations(
         close = (
             scores["voxel_iou"] >= min_iou and scores["chamfer_l2"] <= max_chamfer
         )
-        passed = close and (not exact or not mismatches)
+        passed = close and solid_comparison["equivalent"] and (not exact or not mismatches)
         comparisons.append(
             RepresentationComparison(
                 left=left,
@@ -436,6 +450,7 @@ def compare_representations(
                 mismatches=mismatches,
                 scores={
                     **scores,
+                    "solid_comparison": solid_comparison,
                     "min_iou": min_iou,
                     "max_chamfer": max_chamfer,
                     "sampling_noise_floor": floor,

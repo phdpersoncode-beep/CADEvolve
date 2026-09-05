@@ -1,0 +1,143 @@
+{
+  "programs": 5000,
+  "passed": 4986,
+  "failed": 14,
+  "gates": {
+    "converts": {
+      "passed": 5000,
+      "failed": 0,
+      "skipped": 0
+    },
+    "structure": {
+      "passed": 5000,
+      "failed": 0,
+      "skipped": 0
+    },
+    "idempotent": {
+      "passed": 0,
+      "failed": 5000,
+      "skipped": 0
+    },
+    "parameters_preserved": {
+      "passed": 4994,
+      "failed": 6,
+      "skipped": 0
+    },
+    "parameters_placed_late": {
+      "passed": 4997,
+      "failed": 3,
+      "skipped": 0
+    },
+    "loops_preserved": {
+      "passed": 5000,
+      "failed": 0,
+      "skipped": 0
+    },
+    "literals_stable": {
+      "passed": 5000,
+      "failed": 0,
+      "skipped": 0
+    },
+    "chains_lowered": {
+      "passed": 4995,
+      "failed": 5,
+      "skipped": 0
+    },
+    "loop_bindings_preserved": {
+      "passed": 5000,
+      "failed": 0,
+      "skipped": 0
+    },
+    "actions_reassemble": {
+      "passed": 5000,
+      "failed": 0,
+      "skipped": 0
+    },
+    "source_executes": {
+      "passed": 0,
+      "failed": 0,
+      "skipped": 5000
+    },
+    "canonical_executes": {
+      "passed": 0,
+      "failed": 0,
+      "skipped": 5000
+    },
+    "source_deterministic": {
+      "passed": 0,
+      "failed": 0,
+      "skipped": 5000
+    },
+    "topology_identical": {
+      "passed": 0,
+      "failed": 0,
+      "skipped": 5000
+    },
+    "shape_identical": {
+      "passed": 0,
+      "failed": 0,
+      "skipped": 5000
+    },
+    "prefixes_execute": {
+      "passed": 0,
+      "failed": 0,
+      "skipped": 5000
+    },
+    "quantization_commutes": {
+      "passed": 0,
+      "failed": 0,
+      "skipped": 5000
+    },
+    "quantized_shape_close": {
+      "passed": 0,
+      "failed": 0,
+      "skipped": 5000
+    },
+    "parameter_perturbation": {
+      "passed": 0,
+      "failed": 0,
+      "skipped": 5000
+    }
+  },
+  "parameter_retention": {
+    "count": 5000,
+    "min": 0.8333333333333334,
+    "mean": 0.9998846688605512,
+    "median": 1.0,
+    "p05": 1.0,
+    "p95": 1.0,
+    "max": 1.0
+  },
+  "preamble_coverage": {
+    "count": 4711,
+    "min": 0.0,
+    "mean": 0.9953300785395882,
+    "median": 1.0,
+    "p05": 1.0,
+    "p95": 1.0,
+    "max": 1.0
+  },
+  "exact_voxel_iou": null,
+  "exact_chamfer_l2": null,
+  "quantized_voxel_iou": null,
+  "quantized_chamfer_l2": null,
+  "binarizer_baseline_iou": null,
+  "parameter_groups": {
+    "count": 5000,
+    "min": 0.0,
+    "mean": 3.9038,
+    "median": 4.0,
+    "p05": 1.0,
+    "p95": 7.0,
+    "max": 12.0
+  },
+  "total_loops_preserved": 2082,
+  "total_workplane_steps": 110698,
+  "ignored_gates": [
+    "idempotent"
+  ],
+  "seconds": 76.55173613399984,
+  "corpus": "demo",
+  "loop_mode": "preserve",
+  "parameter_placement": "late"
+}

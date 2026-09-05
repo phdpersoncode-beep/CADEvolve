@@ -879,7 +879,10 @@ class _ProtectedNameCollector(_SkipNestedScopes):
     def visit_For(self, node: ast.For) -> None:
         assigned = set().union(*(_assigned_names(stmt) for stmt in node.body)) if node.body else set()
         carried = assigned & _loads_before_definition(node.body)
-        self.protected.update(carried)
+        # A loop can execute zero times. Its last assignment (including its
+        # target) cannot replace a reaching definition from before the loop.
+        # Keep these bindings at runtime rather than exporting lexical SSA.
+        self.protected.update(_assigned_names(node))
         self.loop_carried.update(carried)
         for stmt in node.body + node.orelse:
             self.visit(stmt)
@@ -921,7 +924,9 @@ class _SSARenamer:
         protected.visit(tree)
 
         self.repeated = {name for name, count in counter.counts.items() if count > 1}
-        self.protected = protected.protected | {result_name}
+        # Helpers resolve module globals when called, not when defined. Their
+        # bodies deliberately keep source names, so those globals must do so too.
+        self.protected = protected.protected | _nested_scope_reads(tree) | {result_name}
         self.report = report
         self.report.loop_carried_names = sorted(protected.loop_carried)
         self.next_index: defaultdict[str, int] = defaultdict(int)
@@ -1791,10 +1796,10 @@ def _nested_scope_reads(tree: ast.AST) -> set[str]:
 
     names: set[str] = set()
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            bodies: list[ast.AST] = list(node.body)
-        elif isinstance(node, ast.Lambda):
-            bodies = [node.body]
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            # Defaults, decorators and annotations can also read a binding that
+            # SSA would otherwise rename. Conservatively keep those names too.
+            bodies: list[ast.AST] = [node]
         else:
             continue
         for body in bodies:
@@ -2298,19 +2303,36 @@ class _WorkplaneLowerer:
                 continue
 
             if isinstance(stmt, ast.AnnAssign):
-                if stmt.value is not None:
-                    prefix, value, is_geometry = self._lower_expr(
-                        stmt.value, aliases, dynamic
+                if not isinstance(stmt.target, ast.Name):
+                    # Keep attribute/subscript assignments intact: splitting off
+                    # a bare annotation would evaluate the target a second time.
+                    if stmt.value is not None:
+                        prefix, stmt.value, _ = self._lower_expr(
+                            stmt.value, aliases, dynamic
+                        )
+                        output.extend(prefix)
+                    output.append(
+                        _rewrite_loads(stmt, self._load_mapping(aliases, dynamic))
                     )
-                    output.extend(prefix)
-                    if isinstance(stmt.target, ast.Name) and is_geometry:
-                        value = self._spill_geometry(value, stmt, output)
-                        aliases[stmt.target.id] = value.id
-                        continue
-                    stmt.value = value
-                output.append(
-                    _rewrite_loads(stmt, self._load_mapping(aliases, dynamic))
+                    continue
+                if stmt.value is not None:
+                    # An annotation does not change the assignment's reaching
+                    # definition. Reuse the ordinary assignment path, including
+                    # branch/loop state writes and terminal aliases.
+                    assignment = ast.copy_location(
+                        ast.Assign(targets=[stmt.target], value=stmt.value), stmt
+                    )
+                    lowered, aliases, dynamic = self._lower_block(
+                        [assignment], aliases, dynamic, tracks_result=tracks_result
+                    )
+                    output.extend(lowered)
+                    # Python evaluates a module/class annotation after the value
+                    # assignment. Keep that annotation and its original key.
+                    stmt.value = None
+                stmt.annotation = _rewrite_loads(
+                    stmt.annotation, self._load_mapping(aliases, dynamic)
                 )
+                output.append(stmt)
                 continue
 
             if isinstance(stmt, ast.For):

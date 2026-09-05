@@ -1,0 +1,21 @@
+{
+  "counts": {
+    "match": 16,
+    "source_unstable": 5,
+    "canonical_error": 1,
+    "signature_mismatch": 2
+  },
+  "tracer_counts": {},
+  "seconds": 56.50391609400003,
+  "options": {
+    "corpus": "../tmp/recheck_deep",
+    "limit": null,
+    "seed": 0,
+    "workers": 2,
+    "timeout": 120.0,
+    "boolean": false,
+    "trace": false,
+    "repeats": 12,
+    "report": "../tmp/recheck-deep.jsonl"
+  }
+}

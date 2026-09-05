@@ -1,0 +1,23 @@
+{
+  "counts": {
+    "match": 125,
+    "comparison_error": 2,
+    "worker_failure": 1
+  },
+  "tracer_counts": {
+    "match": 114,
+    "error": 11
+  },
+  "seconds": 382.78810393799995,
+  "options": {
+    "corpus": "demo",
+    "limit": 128,
+    "seed": 42,
+    "workers": 2,
+    "timeout": 180.0,
+    "boolean": true,
+    "trace": true,
+    "repeats": 1,
+    "report": "../tmp/audit-tracer-release.jsonl"
+  }
+}

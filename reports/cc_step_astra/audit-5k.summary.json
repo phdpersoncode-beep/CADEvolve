@@ -1,0 +1,23 @@
+{
+  "counts": {
+    "match": 4932,
+    "source_error": 22,
+    "signature_mismatch": 8,
+    "canonical_error": 2,
+    "source_invalid": 6,
+    "source_unstable": 21,
+    "worker_failure": 9
+  },
+  "tracer_counts": {},
+  "seconds": 2024.7302374150001,
+  "options": {
+    "corpus": "demo",
+    "limit": null,
+    "seed": 0,
+    "workers": 6,
+    "timeout": 90.0,
+    "boolean": false,
+    "trace": false,
+    "report": "../tmp/audit-5k.jsonl"
+  }
+}

@@ -131,21 +131,23 @@ def patch():
             in_plane = 'XY'
 
 
-        obj_val = kwargs.get("obj", None)
-        if obj_val is None and len(args) >= 2:
-            obj_val = args[1]
-
-        if obj_val is not None and not isinstance(obj_val, (str, _CQPlane)):
-            return
+        origin = kwargs.get("origin", args[1] if len(args) >= 2 else (0, 0, 0))
+        obj_val = kwargs.get("obj", args[2] if len(args) >= 3 else None)
         if not isinstance(in_plane, (str, _CQPlane)):
             return
+
+        constructor_kwargs = {"origin": _ser(origin)}
+        if obj_val is not None:
+            if not isinstance(obj_val, cq.Shape) or _get_id(obj_val) is None:
+                raise ValueError("cannot trace a Workplane with an unrecorded obj")
+            constructor_kwargs["obj"] = _ser(obj_val)
 
         op_id = _new_id()
         LOG.append({
             "id": op_id,
             "op": "Workplane",
             "args": [_ser(in_plane)],
-            "kwargs": {}
+            "kwargs": constructor_kwargs
         })
         _tag(self, op_id)
         _bind_existing_attrs(op_id, self)
@@ -571,9 +573,13 @@ def _py_map(v, idmap):
     if isinstance(v, dict):
         if "__wp_ref__" in v:
             oid = v["__wp_ref__"]
+            if oid is None or oid not in idmap:
+                raise ValueError("cannot replay an unrecorded Workplane reference")
             return f"wp{idmap.get(oid, oid)}"
         if "__shape_ref__" in v:
             sid = v["__shape_ref__"]
+            if sid is None or sid not in idmap:
+                raise ValueError("cannot replay an unrecorded Shape reference")
             return f"wp{idmap.get(sid, sid)}"
         if "__sel_ref__" in v:
             sel_id = v["__sel_ref__"]
@@ -598,10 +604,16 @@ def _py_map(v, idmap):
     return repr(v)
 
 
-def standardize_code(log, final_var="result"):
+def standardize_code(log, final_var="result", *, final_ref=_MISSING):
     lines = ["import cadquery as cq"]
 
     needed_shapes = _collect_needed_shape_ids(log)
+    if final_ref is not _MISSING:
+        if not isinstance(final_ref, dict) or not any(
+            final_ref.get(key) is not None for key in ("__wp_ref__", "__shape_ref__")
+        ):
+            raise ValueError("terminal result has no recorded CadQuery reference")
+        needed_shapes.update(_collect_needed_shape_ids([{"args": [final_ref]}]))
 
     idmap = {}
     next_id = 1
@@ -639,8 +651,9 @@ def standardize_code(log, final_var="result"):
             continue
 
         if op["op"] == "Workplane":
-            arg = _py_map(op["args"][0], idmap) if op.get("args") else ""
-            lines.append(f"wp{mid(oid)} = cq.Workplane({arg})")
+            parts = [_py_map(a, idmap) for a in op.get("args", [])]
+            parts.extend(f"{k}={_py_map(v, idmap)}" for k, v in sorted(op.get("kwargs", {}).items()))
+            lines.append(f"wp{mid(oid)} = cq.Workplane({', '.join(parts)})")
             last_wp_mapped = mid(oid)
             continue
 
@@ -679,7 +692,13 @@ def standardize_code(log, final_var="result"):
                 last_wp_mapped = mid(oid)
             continue
 
-    lines.append(f"{final_var} = wp{last_wp_mapped}" if last_wp_mapped is not None else f"{final_var} = None")
+    if final_ref is not _MISSING:
+        reference_id = final_ref.get("__wp_ref__", final_ref.get("__shape_ref__"))
+        if reference_id not in idmap:
+            raise ValueError("terminal result reference was not emitted")
+        lines.append(f"{final_var} = {_py_map(final_ref, idmap)}")
+    else:
+        lines.append(f"{final_var} = wp{last_wp_mapped}" if last_wp_mapped is not None else f"{final_var} = None")
     return "\n".join(lines)
 
 
@@ -976,7 +995,7 @@ def process_detail(task):
 
                     try:
                         save_json(str(trace_json_path))
-                        code = standardize_code(LOG, final_var="result")
+                        code = standardize_code(LOG, final_var="result", final_ref=_ser(ns_record["result"]))
                         save_code(str(standardized_path), code)
                         attempt["stages"]["standardize"] = True
                     except Exception as e:
@@ -1074,7 +1093,7 @@ def process_detail(task):
 
                 try:
                     save_json(str(trace_json_path))
-                    code = standardize_code(LOG, final_var="result")
+                    code = standardize_code(LOG, final_var="result", final_ref=_ser(ns_record["result"]))
                     save_code(str(standardized_path), code)
                     rec["stages"]["standardize"] = True
                 except Exception as e:

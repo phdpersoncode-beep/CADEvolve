@@ -1,0 +1,491 @@
+[
+  {
+    "name": "03a487cf-8cb0-e418-d16b-70df5dde4062.py",
+    "failed_gates": [
+      "parameters_preserved"
+    ],
+    "gates": [
+      {
+        "name": "parameters_preserved",
+        "passed": false,
+        "skipped": false,
+        "detail": {
+          "source_parameters": 12,
+          "retained": 10,
+          "retention": 0.8333333333333334,
+          "lost": [
+            "outer_diameter",
+            "wall_thickness"
+          ],
+          "inlined": []
+        },
+        "error": null,
+        "seconds": 2.774000222416362e-06
+      }
+    ]
+  },
+  {
+    "name": "110adec1-68ab-223e-1ef3-e197231db32c.py",
+    "failed_gates": [
+      "chains_lowered"
+    ],
+    "gates": [
+      {
+        "name": "chains_lowered",
+        "passed": false,
+        "skipped": false,
+        "detail": {
+          "source_chain_depth": 6,
+          "canonical_chain_depth": 2,
+          "workplane_steps": 20
+        },
+        "error": null,
+        "seconds": 6.010000106471125e-07
+      }
+    ]
+  },
+  {
+    "name": "290a9dff-7122-03b4-7a34-0ef96fb14fde.py",
+    "failed_gates": [
+      "parameters_preserved"
+    ],
+    "gates": [
+      {
+        "name": "parameters_preserved",
+        "passed": false,
+        "skipped": false,
+        "detail": {
+          "source_parameters": 11,
+          "retained": 10,
+          "retention": 0.9090909090909091,
+          "lost": [
+            "hole_spacing"
+          ],
+          "inlined": []
+        },
+        "error": null,
+        "seconds": 4.26600036007585e-06
+      }
+    ]
+  },
+  {
+    "name": "48714a1c-0c24-526d-1b36-7e7cba28d680.py",
+    "failed_gates": [
+      "chains_lowered"
+    ],
+    "gates": [
+      {
+        "name": "chains_lowered",
+        "passed": false,
+        "skipped": false,
+        "detail": {
+          "source_chain_depth": 5,
+          "canonical_chain_depth": 4,
+          "workplane_steps": 15
+        },
+        "error": null,
+        "seconds": 4.4999978854320943e-07
+      }
+    ]
+  },
+  {
+    "name": "489f89a3-e030-c4f6-cb31-2e0b592641d2.py",
+    "failed_gates": [
+      "chains_lowered"
+    ],
+    "gates": [
+      {
+        "name": "chains_lowered",
+        "passed": false,
+        "skipped": false,
+        "detail": {
+          "source_chain_depth": 6,
+          "canonical_chain_depth": 2,
+          "workplane_steps": 32
+        },
+        "error": null,
+        "seconds": 7.910002750577405e-07
+      }
+    ]
+  },
+  {
+    "name": "61eaaebf-eede-263d-d3fd-01591bd20011.py",
+    "failed_gates": [
+      "chains_lowered"
+    ],
+    "gates": [
+      {
+        "name": "chains_lowered",
+        "passed": false,
+        "skipped": false,
+        "detail": {
+          "source_chain_depth": 6,
+          "canonical_chain_depth": 2,
+          "workplane_steps": 37
+        },
+        "error": null,
+        "seconds": 6.310001481324434e-07
+      }
+    ]
+  },
+  {
+    "name": "71bef0e9-e7c9-0aa2-1cfe-698742dfd050.py",
+    "failed_gates": [
+      "parameters_preserved"
+    ],
+    "gates": [
+      {
+        "name": "parameters_preserved",
+        "passed": false,
+        "skipped": false,
+        "detail": {
+          "source_parameters": 13,
+          "retained": 12,
+          "retention": 0.9230769230769231,
+          "lost": [
+            "hole_spacing"
+          ],
+          "inlined": []
+        },
+        "error": null,
+        "seconds": 3.2850002753548324e-06
+      }
+    ]
+  },
+  {
+    "name": "747bca10-c393-0695-88aa-e1daa9b53a32.py",
+    "failed_gates": [
+      "parameters_preserved"
+    ],
+    "gates": [
+      {
+        "name": "parameters_preserved",
+        "passed": false,
+        "skipped": false,
+        "detail": {
+          "source_parameters": 10,
+          "retained": 9,
+          "retention": 0.9,
+          "lost": [
+            "pocket_width"
+          ],
+          "inlined": []
+        },
+        "error": null,
+        "seconds": 3.004000063810963e-06
+      }
+    ]
+  },
+  {
+    "name": "99e50406-7ab6-e2f6-f2f9-eeaed14fc2c1.py",
+    "failed_gates": [
+      "parameters_placed_late"
+    ],
+    "gates": [
+      {
+        "name": "parameters_placed_late",
+        "passed": false,
+        "skipped": false,
+        "detail": {
+          "parameter_count": 19,
+          "group_count": 4,
+          "first_group_size": 4,
+          "largest_group": 11,
+          "grouped": false,
+          "early_parameters": [
+            "rib_x_offsets"
+          ],
+          "unread_parameters": [],
+          "groups": [
+            {
+              "parameters": [
+                "leaf_width",
+                "rib_width",
+                "rib_spacing",
+                "rib_count"
+              ],
+              "step_size": 1
+            },
+            {
+              "parameters": [
+                "rib_x_offsets",
+                "leaf_height",
+                "leaf_thickness",
+                "cutout_diameter",
+                "cutout_offset_y",
+                "hole_diameter",
+                "hole_spacing_x",
+                "hole_spacing_y",
+                "hole_rows",
+                "hole_columns",
+                "chamfer_distance"
+              ],
+              "step_size": 13
+            },
+            {
+              "parameters": [
+                "rib_height"
+              ],
+              "step_size": 4
+            },
+            {
+              "parameters": [
+                "tab_width",
+                "tab_height",
+                "tab_hole_dia"
+              ],
+              "step_size": 12
+            }
+          ]
+        },
+        "error": null,
+        "seconds": 1.0120002116309479e-06
+      }
+    ]
+  },
+  {
+    "name": "dab19c7c-5dec-4709-a871-b06639ce9557.py",
+    "failed_gates": [
+      "parameters_placed_late"
+    ],
+    "gates": [
+      {
+        "name": "parameters_placed_late",
+        "passed": false,
+        "skipped": false,
+        "detail": {
+          "parameter_count": 32,
+          "group_count": 9,
+          "first_group_size": 0,
+          "largest_group": 10,
+          "grouped": false,
+          "early_parameters": [
+            "lower_to_tip",
+            "upper_to_root"
+          ],
+          "unread_parameters": [],
+          "groups": [
+            {
+              "parameters": [],
+              "step_size": 2
+            },
+            {
+              "parameters": [
+                "module",
+                "num_teeth",
+                "pressure_angle_deg",
+                "pitch_dia",
+                "pitch_radius",
+                "addendum",
+                "outer_radius",
+                "pressure_angle",
+                "base_radius",
+                "flank_point_count"
+              ],
+              "step_size": 1
+            },
+            {
+              "parameters": [
+                "circular_pitch",
+                "half_tooth_angle"
+              ],
+              "step_size": 2
+            },
+            {
+              "parameters": [
+                "lower_to_tip",
+                "upper_to_root",
+                "outer_tip_angle_left",
+                "outer_tip_angle_right",
+                "arc_points",
+                "arc_steps"
+              ],
+              "step_size": 1
+            },
+            {
+              "parameters": [
+                "dedendum",
+                "root_radius",
+                "root_right",
+                "root_left",
+                "tooth_pts",
+                "gear_width"
+              ],
+              "step_size": 6
+            },
+            {
+              "parameters": [
+                "hub_radius"
+              ],
+              "step_size": 4
+            },
+            {
+              "parameters": [
+                "shaft_bore_dia"
+              ],
+              "step_size": 4
+            },
+            {
+              "parameters": [
+                "key_width",
+                "key_depth"
+              ],
+              "step_size": 4
+            },
+            {
+              "parameters": [
+                "mount_hole_dia",
+                "mount_hole_count",
+                "mount_hole_circle_radius"
+              ],
+              "step_size": 2
+            },
+            {
+              "parameters": [
+                "chamfer_size"
+              ],
+              "step_size": 5
+            }
+          ]
+        },
+        "error": null,
+        "seconds": 1.1920001270482317e-06
+      }
+    ]
+  },
+  {
+    "name": "db11002a-3291-6bbb-0419-5f562a9f2f40.py",
+    "failed_gates": [
+      "parameters_preserved"
+    ],
+    "gates": [
+      {
+        "name": "parameters_preserved",
+        "passed": false,
+        "skipped": false,
+        "detail": {
+          "source_parameters": 12,
+          "retained": 11,
+          "retention": 0.9166666666666666,
+          "lost": [
+            "leg_thickness"
+          ],
+          "inlined": []
+        },
+        "error": null,
+        "seconds": 3.4149998100474477e-06
+      }
+    ]
+  },
+  {
+    "name": "eac7e380-9ea9-213e-7d65-d313cb956b6b.py",
+    "failed_gates": [
+      "parameters_preserved"
+    ],
+    "gates": [
+      {
+        "name": "parameters_preserved",
+        "passed": false,
+        "skipped": false,
+        "detail": {
+          "source_parameters": 17,
+          "retained": 16,
+          "retention": 0.9411764705882353,
+          "lost": [
+            "base_sketch"
+          ],
+          "inlined": []
+        },
+        "error": null,
+        "seconds": 1.8630007616593502e-06
+      }
+    ]
+  },
+  {
+    "name": "f5529fee-1ed3-0eb8-236f-cc0bdff0a173.py",
+    "failed_gates": [
+      "parameters_placed_late"
+    ],
+    "gates": [
+      {
+        "name": "parameters_placed_late",
+        "passed": false,
+        "skipped": false,
+        "detail": {
+          "parameter_count": 14,
+          "group_count": 5,
+          "first_group_size": 2,
+          "largest_group": 4,
+          "grouped": false,
+          "early_parameters": [
+            "hole_positions_1"
+          ],
+          "unread_parameters": [],
+          "groups": [
+            {
+              "parameters": [
+                "overall_size",
+                "plate_thickness"
+              ],
+              "step_size": 3
+            },
+            {
+              "parameters": [
+                "pocket_size",
+                "pocket_depth"
+              ],
+              "step_size": 4
+            },
+            {
+              "parameters": [
+                "rib_width",
+                "rib_height"
+              ],
+              "step_size": 5
+            },
+            {
+              "parameters": [
+                "hole_positions_1",
+                "edge_margin",
+                "half",
+                "om"
+              ],
+              "step_size": 4
+            },
+            {
+              "parameters": [
+                "hole_diameter",
+                "countersink_angle",
+                "countersink_diameter",
+                "total_depth"
+              ],
+              "step_size": 5
+            }
+          ]
+        },
+        "error": null,
+        "seconds": 7.010003173490986e-07
+      }
+    ]
+  },
+  {
+    "name": "ffd4c090-75bc-243f-2aa4-99b432e7fe56.py",
+    "failed_gates": [
+      "chains_lowered"
+    ],
+    "gates": [
+      {
+        "name": "chains_lowered",
+        "passed": false,
+        "skipped": false,
+        "detail": {
+          "source_chain_depth": 5,
+          "canonical_chain_depth": 3,
+          "workplane_steps": 30
+        },
+        "error": null,
+        "seconds": 5.609999789157882e-07
+      }
+    ]
+  }
+]

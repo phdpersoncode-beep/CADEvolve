@@ -1,0 +1,21 @@
+{
+  "counts": {
+    "match": 11,
+    "comparison_error": 1
+  },
+  "tracer_counts": {
+    "match": 11
+  },
+  "seconds": 34.99041387299985,
+  "options": {
+    "corpus": "fixtures",
+    "limit": null,
+    "seed": 0,
+    "workers": 2,
+    "timeout": 120.0,
+    "boolean": true,
+    "trace": true,
+    "repeats": 1,
+    "report": "../tmp/audit-fixtures-confirmed.jsonl"
+  }
+}

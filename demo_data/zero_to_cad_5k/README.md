@@ -5,10 +5,12 @@ This folder contains 5,000 unmodified `cadquery_file` programs from the
 The exact upstream revision and archive checksum are recorded in
 `manifest.json`. The upstream dataset is Apache-2.0 licensed.
 
-The checked-in `validation.json` records a complete structural CC-for scan:
+The checked-in `validation.json` records the original structural CC-for scan:
 5,000 passed, 0 failed, 110,696 explicit workplane actions were emitted, and
 2,082 loops were preserved. Geometry execution remains a sampled gate because
 executing thousands of OpenCascade programs is intentionally much slower.
+For the later CC-step execution audit, stronger geometry checks, and explicit
+failure categories, see [the astra-and-beyond report](../../docs/cc_step_astra_audit.md).
 
 The programs are stored as one deterministic `raw_sources.tar.gz` archive
 instead of 5,000 loose Git objects. Extract them with:
